@@ -67,7 +67,9 @@ jobs:
           "$NM" -D --defined-only build/libAnimatedMojang.so | grep -q ' PLGetModRegistration$'
           test -s vendor/nmdk/libs/arm64-v8a/libnmdk.so  # link-time only; NOT packaged
       - name: Package LeviPack
-        run: tools/make_levipack.sh build/libAnimatedMojang.so dist/animated_mojang.levipack
+        run: |
+          chmod +x tools/make_levipack.sh
+          tools/make_levipack.sh build/libAnimatedMojang.so dist/animated_mojang.levipack
       - uses: actions/upload-artifact@v4
         with:
           name: animated-mojang-levipack
