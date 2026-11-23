@@ -1,27 +1,25 @@
 #include "client/Client.h"
+#include "client/Signatures.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cmath>
-#include <cstdio>
-#include <cstring>
-#include <memory>
+#include <cstdint>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <vector>
 
-#include <dlfcn.h>
-#include <elf.h>
-#include <link.h>
-#include <unistd.h>
 #include <EGL/egl.h>
-#include <GLES2/gl2.h>
+#include <GLES3/gl3.h>
 
+#include <nmdk/NMDK.hpp>
+
+#include "PathView.h"
 #include "animation/Timeline.h"
-#include "ll/api/Logger.h"
-#include "ll/api/memory/Hook.h"
 #include "mod/MyMod.h"
 #include "scene/CaveCamera.h"
 #include "scene/CaveGlesRenderer.h"
@@ -70,8 +68,24 @@ std::atomic_bool sInsideCaveRender = false;
 std::atomic_bool sNormalLoadingComplete = false;
 std::atomic_bool sIsStartScreen = true;
 std::atomic_bool sModalDialogueActive = false;
+std::atomic<double> sModalSinceMs = 0.0;      // when the modal flag was raised (render-thread expiry)
 std::atomic<double> sLastStartMenuTickMs = 0.0;
+// The vanilla title logo is never shown again: it is always blanked while the mod is active.
+// The replacement title itself is drawn only on the Start Menu screen (see renderMenuFrame).
+std::atomic_bool sInterceptTitleTexture = true;
+// Safety net: a "modal" raised by a heuristic (screen name / non-navigating button) can miss its
+// close event. Never keep the title hidden for longer than this because of the flag alone.
+constexpr double kModalMaxHideMs = 10000.0;
 std::atomic_bool sSuppressUiDrawing = false;
+// ClientInstance saved by the update hook once isInitFinished is true; used to ask for the current screen name.
+std::atomic<void*> sClientInstance{nullptr};
+// Current screen as reported by ClientInstance::getScreenName (updated every ClientInstance::update).
+//   Start    : "start_screen"                      -> replacement logo in the cave pass
+//   Pause    : "pause_screen"                      -> overlay logo above the pause buttons
+//   Progress : "progress.world_saving_progress_screen" / "world_loading_progress_screen" -> overlay logo
+enum class ScreenKind : int { Unknown = -1, Other = 0, Start = 1, Pause = 2, Progress = 3 };
+std::atomic<int> sScreenKind{static_cast<int>(ScreenKind::Unknown)};
+std::atomic<int> sViewportW{0}, sViewportH{0}; // last menu viewport (avoids a glGetIntegerv per swap)
 
 // Lock-free snapshot of presentation state for hooks that must not take the mutex.
 std::atomic<scene::CavePage> sCurrentPage{scene::CavePage::Main};
@@ -90,6 +104,12 @@ double nowMs() {
 
 auto& logger() {
     return my_mod::MyMod::getInstance().getLogger();
+}
+
+// Raises/clears the modal flag and remembers when it was raised.
+void setModalActive(bool on) {
+    if (!on) { sModalDialogueActive.store(false); return; }
+    if (!sModalDialogueActive.exchange(true)) sModalSinceMs.store(nowMs());
 }
 
 bool matches(std::vector<std::string> const& names, std::string const& name) {
@@ -117,163 +137,9 @@ void updatePresentation(double time, bool foregroundMenu, bool ready) {
     sMenuAlpha.store(runtime.frame.menuAlpha);
 }
 
-// ----------------------------------------------------------------------------
-// Multi-Version Offset Table (1.26.44.3, 1.26.45.1, 1.26.51.1, 1.26.52.3)
-// ----------------------------------------------------------------------------
-struct VersionOffsets {
-    const char* versionStr;
-    uintptr_t getTechStackForScreen;
-    uintptr_t startMenuOnOpen;
-    uintptr_t startMenuTick;
-    uintptr_t playButton;
-    uintptr_t settingsButton;
-    uintptr_t realmsButton;
-    uintptr_t dressingRoomButton;
-    uintptr_t skinsMenuButton;
-    uintptr_t marketplaceButton;
-    uintptr_t achievementsButton;
-    uintptr_t feedbackButton;
-    uintptr_t signInButton;
-    uintptr_t menuExit;
-    uintptr_t progressBarRender;
-    uintptr_t inGamePlayScreenRender;
-    uintptr_t clientInstanceRequestLeaveGame;
-    uintptr_t panoramaRender;
-    uintptr_t cubemapBackgroundRender;
-    uintptr_t directoryPackGetAsset;
-    uintptr_t zipPackGetAsset;
-    uintptr_t glClearGotRva;
-    uintptr_t glColorMaskGotRva;
-    uintptr_t eglSwapBuffersGotRva;
-    size_t uiControlAlphaOffset;
-    size_t uiControlParentOffset;
-};
-
-static const VersionOffsets kOffsets_1_26_52_3 = {
-    "1.26.52.3",
-    0x0974E844, 0x0A2DF314, 0x0A2E1FF4,
-    0x0A31344C, 0x0A3171AC, 0x0A3174DC, 0x0A31815C, 0x0A317C1C, 0x0A3187A4,
-    0x0A316978, 0x0A314D58, 0x0A31972C,
-    0x0A567540,
-    0x09685F70,
-    0x09ACC828, 0x09800FF8,
-    0x0967FA98, 0x09B7C9E0,
-    0x111EEE94, 0x11158670,
-    0x132893d8, 0x13289288, 0x132c7dc0,
-    0x58, 0x128
-};
-
-static const VersionOffsets kOffsets_1_26_51_1 = {
-    "1.26.51.1",
-    0x0974E7A4, 0x0A2DF2A4, 0x0A2E1F84,
-    0x0A3133DC, 0x0A31713C, 0x0A31746C, 0x0A3180EC, 0x0A317BAC, 0x0A318734,
-    0x0A316908, 0x0A314CE8, 0x0A3196BC,
-    0x0A5674D0,
-    0x09685ED0,
-    0x09ACC7A8, 0x09800F58,
-    0x0967F9F8, 0x09B7C960,
-    0x111EEA54, 0x11158230,
-    0x13289078, 0x13288F28, 0x132C7A60,
-    0x58, 0x128
-};
-
-static const VersionOffsets kOffsets_1_26_45_1 = {
-    "1.26.45.1",
-    0x0938B714, 0x09EBD95C, 0x09EC05D8,
-    0x09EF3D64, 0x09EF72C0, 0x09EF75F0, 0x09EF8270, 0x09EF7D30, 0x09EF88A4,
-    0x09EF69E4, 0x09EF52FC, 0x09EF9888,
-    0x0A15248C,
-    0x092BEC2C,
-    0x0974066C, 0x0943C430,
-    0x092B8DC0, 0x097C99A4,
-    0x1042D360, 0x1040D528,
-    0x124C9688, 0x124C9538, 0x12507F20,
-    0x180, 0x8
-};
-
-static const VersionOffsets kOffsets_1_26_44_3 = {
-    "1.26.44.3",
-    0x0938B7B4, 0x09EBD9FC, 0x09EC0678,
-    0x09EF3E04, 0x09EF7360, 0x09EF7690, 0x09EF8310, 0x09EF7DD0, 0x09EF8944,
-    0x09EF6A84, 0x09EF539C, 0x09EF9928,
-    0x0A15252C,
-    0x092BECCC,
-    0x0974070C, 0x0943C4D0,
-    0x092B8E60, 0x097C9A44,
-    0x1042D8C0, 0x1040DA88,
-    0x124C9D28, 0x124C9BD8, 0x125085C0,
-    0x180, 0x8
-};
-
-static VersionOffsets sOffsets = {};
-
-static VersionOffsets detectOffsets() {
-    std::string buildId;
-    dl_iterate_phdr([](struct dl_phdr_info* info, size_t, void* data) -> int {
-        auto* outId = static_cast<std::string*>(data);
-        if (!info->dlpi_name || !strstr(info->dlpi_name, "libminecraftpe.so")) {
-            return 0;
-        }
-        for (int i = 0; i < info->dlpi_phnum; ++i) {
-            if (info->dlpi_phdr[i].p_type == PT_NOTE) {
-                const uint8_t* notePtr = reinterpret_cast<const uint8_t*>(info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
-                size_t remaining = info->dlpi_phdr[i].p_memsz;
-                while (remaining >= sizeof(Elf64_Nhdr)) {
-                    const auto* nhdr = reinterpret_cast<const Elf64_Nhdr*>(notePtr);
-                    size_t nameLen = (nhdr->n_namesz + 3) & ~3;
-                    size_t descLen = (nhdr->n_descsz + 3) & ~3;
-                    if (sizeof(Elf64_Nhdr) + nameLen + descLen > remaining) break;
-                    const char* name = reinterpret_cast<const char*>(notePtr + sizeof(Elf64_Nhdr));
-                    if (nhdr->n_type == NT_GNU_BUILD_ID && nhdr->n_namesz == 4 && memcmp(name, "GNU", 3) == 0) {
-                        const uint8_t* desc = notePtr + sizeof(Elf64_Nhdr) + nameLen;
-                        char hex[64];
-                        for (size_t b = 0; b < nhdr->n_descsz && b < 32; ++b) {
-                            snprintf(hex + b * 2, sizeof(hex) - b * 2, "%02x", desc[b]);
-                        }
-                        *outId = hex;
-                        return 1;
-                    }
-                    notePtr += sizeof(Elf64_Nhdr) + nameLen + descLen;
-                    remaining -= sizeof(Elf64_Nhdr) + nameLen + descLen;
-                }
-            }
-        }
-        return 0;
-    }, &buildId);
-
-    if (!buildId.empty()) {
-        logger().info("Discovered libminecraftpe.so GNU Build ID: ", buildId);
-        if (buildId.rfind("b480c79a", 0) == 0) {
-            return kOffsets_1_26_44_3;
-        } else if (buildId.rfind("56de9eed", 0) == 0) {
-            return kOffsets_1_26_52_3;
-        } else if (buildId.rfind("868e275c", 0) == 0 || buildId.rfind("86895c02", 0) == 0) {
-            return kOffsets_1_26_45_1;
-        } else if (buildId.rfind("712509dc", 0) == 0) {
-            return kOffsets_1_26_51_1;
-        }
-    }
-
-    FILE* fp = fopen("/proc/self/maps", "r");
-    if (fp) {
-        char line[512];
-        while (fgets(line, sizeof(line), fp)) {
-            if (strstr(line, "libminecraftpe.so")) {
-                if (strstr(line, "1.26.44")) { fclose(fp); return kOffsets_1_26_44_3; }
-                if (strstr(line, "1.26.45")) { fclose(fp); return kOffsets_1_26_45_1; }
-                if (strstr(line, "1.26.51")) { fclose(fp); return kOffsets_1_26_51_1; }
-                if (strstr(line, "1.26.52")) { fclose(fp); return kOffsets_1_26_52_3; }
-            }
-        }
-        fclose(fp);
-    }
-    return kOffsets_1_26_52_3; // Default fallback
-}
-
-
-// ----------------------------------------------------------------------------
-// Reverse-Engineered Native Hooks (Multi-Version Android ARM64)
-// ----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// Signature-resolved Native Hooks (version-independent where patterns match)
+// -----------------------------------------------------------------------------
 
 // 1. ui::ScreenTechStackSelector::getTechStackForScreen
 using GetTechStackFn = int (*)(void*, std::string const&);
@@ -289,6 +155,11 @@ static int Hooked_ScreenTechStackSelector_getTechStackForScreen(void* self, std:
             return sOriginalGetTechStack ? sOriginalGetTechStack(self, name) : 0;
         }
 
+        // Social drawer: an overlay on the Start Menu. The replacement title must stay, so no state changes.
+        if (scene::isSocialDrawerScreen(name) || scene::isSocialDrawerRoute(name)) {
+            return sOriginalGetTechStack ? sOriginalGetTechStack(self, name) : 0;
+        }
+
         const bool isStart = (lowerName == "start_screen" || lowerName == "/main-menu"
             || lowerName == "main_menu_screen"
             || matches(runtime.config.menuScreenNames, name) || matches(runtime.config.menuScreenNames, lowerName));
@@ -298,8 +169,14 @@ static int Hooked_ScreenTechStackSelector_getTechStackForScreen(void* self, std:
         bool isModal = false;
         for (const char* word : kModalWords) isModal = isModal || lowerName.find(word) != std::string::npos;
 
-        if (isModal) {
-            sModalDialogueActive.store(true);
+        const auto mappedPage = [&]() {
+            auto p = scene::cavePageForRoute(name);
+            return p ? p : scene::cavePageForScreen(name);
+        }();
+
+        if (isModal && !mappedPage.has_value()) {
+            // Only a pure dialogue (no page of its own) hides the title through the modal flag.
+            setModalActive(true);
             sIsStartScreen.store(false);
             logger().info("[AnimatedMojang] Modal/dialogue screen detected: ", name, " -> title suppressed");
         } else if (isStart) {
@@ -310,8 +187,7 @@ static int Hooked_ScreenTechStackSelector_getTechStackForScreen(void* self, std:
             sModalDialogueActive.store(false);
         }
 
-        auto page = scene::cavePageForRoute(name);
-        if (!page) page = scene::cavePageForScreen(name);
+        const auto& page = mappedPage;
         if (page.has_value() && sCurrentPage.load() != *page) {
             logger().info("[AnimatedMojang] Screen change detected: ", name, " -> Page ", static_cast<int>(*page));
             sCurrentPage.store(*page);
@@ -323,6 +199,8 @@ static int Hooked_ScreenTechStackSelector_getTechStackForScreen(void* self, std:
                 sModalDialogueActive.store(false);
             } else {
                 sIsStartScreen.store(false);
+                // A modal that belongs to a sub-page must not outlive it and hide the title on Main.
+                sModalDialogueActive.store(false);
             }
         }
         if (isStart || name == "/start-from-template") {
@@ -372,7 +250,7 @@ static void Hooked_StartMenuScreenController_onOpen(void* self) {
         sIsInWorld.store(false);
         sIsLoading.store(false);
         sIsStartScreen.store(true);
-        sModalDialogueActive.store(false);
+        sModalDialogueActive.store(false); // a re-opened start menu never sits under a stale modal flag
         onNormalLoadingComplete();
 
         std::lock_guard guard(runtime.mutex);
@@ -407,7 +285,15 @@ static std::atomic<bool> sFirstMenuTick = false;
 
 static void Hooked_StartMenuScreenController_tick(void* self) {
     if (active.load()) {
-        sLastStartMenuTickMs.store(nowMs());
+        const double now = nowMs();
+        const double previousTick = sLastStartMenuTickMs.exchange(now);
+        // The tick stream paused while another screen was on top and resumed: that screen is gone,
+        // so a modal raised for it must not keep hiding the title.
+        if (sModalDialogueActive.load() && previousTick > 0.0 && now - previousTick > 250.0
+            && sCurrentPage.load() == scene::CavePage::Main) {
+            logger().info("[AnimatedMojang] Start menu is on top again -> stale modal cleared.");
+            sModalDialogueActive.store(false);
+        }
         sIsStartScreen.store(sCurrentPage.load() == scene::CavePage::Main && !sModalDialogueActive.load());
 
         if (!sFirstMenuTick.exchange(true) || sIsLoading.load()) {
@@ -445,6 +331,28 @@ static constexpr ButtonSpec kButtons[] = {
     {"Sign In -> modal dialogue", false, scene::CavePage::Main},
 };
 
+// Moves the presentation to a sub-page vista: camera glides there and the title is hidden.
+// Shared by the button hooks, the screen hook and the OreUI route hook.
+static void enterSubPage(scene::CavePage page) {
+    std::lock_guard guard(runtime.mutex);
+    sCurrentPage.store(page);
+    sIsStartScreen.store(false);
+    sModalDialogueActive.store(false);
+    sIsMainMenu.store(true);
+    sIsInWorld.store(false);
+    sIsLoading.store(false);
+    if (runtime.enteredMenu) runtime.timeline.skip();
+}
+
+// Camera returns to the Main vista and the title comes back.
+static void returnToMainPage() {
+    std::lock_guard guard(runtime.mutex);
+    sCurrentPage.store(scene::CavePage::Main);
+    sIsStartScreen.store(true);
+    sModalDialogueActive.store(false);
+    sIsMainMenu.store(true);
+}
+
 // Returns false when the click must be swallowed (input is blocked during the intro).
 static bool onStartMenuButton(ButtonSpec const& spec) {
     if (!active.load()) return true;
@@ -452,18 +360,12 @@ static bool onStartMenuButton(ButtonSpec const& spec) {
         && sMenuAlpha.load() < 0.95f) {
         return false;
     }
-    std::lock_guard guard(runtime.mutex);
     logger().info("[AnimatedMojang] Button clicked: ", spec.label);
     if (spec.navigates) {
-        sCurrentPage.store(spec.page);
-        sIsStartScreen.store(false);
-        sModalDialogueActive.store(false);
-        sIsMainMenu.store(true);
-        sIsInWorld.store(false);
-        sIsLoading.store(false);
-        if (runtime.enteredMenu) runtime.timeline.skip();
+        enterSubPage(spec.page);
     } else {
-        sModalDialogueActive.store(true);
+        std::lock_guard guard(runtime.mutex);
+        setModalActive(true);
     }
     return true;
 }
@@ -480,14 +382,127 @@ struct ButtonHook {
 static GenericButtonFn sOriginalMenuExit = nullptr;
 static void Hooked_Menu_Exit(void* a0, void* a1, void* a2) {
     if (active.load() && !sIsInWorld.load()) {
-        std::lock_guard guard(runtime.mutex);
         logger().info("[AnimatedMojang] Back / Exit pressed -> camera returns to the Main vista");
-        sCurrentPage.store(scene::CavePage::Main);
-        sIsStartScreen.store(true);
-        sModalDialogueActive.store(false);
-        sIsMainMenu.store(true);
+        returnToMainPage();
     }
     if (sOriginalMenuExit) sOriginalMenuExit(a0, a1, a2);
+}
+
+// 2l. OreUI Router::navigate(route, action)
+// Profile and Inbox have no dedicated button hook: they are OreUI pages opened by pushing a route
+// ("/profile", "/inbox"). Every push funnels through this function, so one hook gives them the same
+// camera glide and title hiding as the hooked StartMenu buttons.
+// The Social drawer ("/friends-drawer", ...) is deliberately ignored: it is an overlay, the title stays.
+using RouteNavigateFn = std::uintptr_t (*)(void*, std::string const*, int);
+static RouteNavigateFn sOriginalRouteNavigate = nullptr;
+
+static bool readRouteString(std::string const* routePtr, std::string& out) noexcept {
+    if (!routePtr) return false;
+    try {
+        const std::size_t size = routePtr->size();
+        if (size == 0 || size > 512) return false;
+        const char* data = routePtr->data();
+        if (!data) return false;
+        for (std::size_t i = 0; i < size; ++i) {
+            const auto c = static_cast<unsigned char>(data[i]);
+            if (c < 0x20 || c > 0x7e) return false; // not a plausible route: leave it alone
+        }
+        out.assign(data, size);
+        return true;
+    } catch (...) {}
+    return false;
+}
+
+static void onRouteNavigate(std::string const& route) {
+    // Only act while the start menu owns the cave: never in a world, never during cold boot.
+    if (!sNormalLoadingComplete.load() || sIsInWorld.load() || sIsLoading.load()) return;
+
+    std::string lower = route;
+    for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (lower.find("pre-start") != std::string::npos) return;
+
+    // Social drawer: overlay on the Start Menu -> camera, page and replacement title stay untouched.
+    if (scene::isSocialDrawerRoute(route)) return;
+
+    const auto page = scene::cavePageForRoute(route);
+    if (page.has_value()) {
+        if (*page == scene::CavePage::Main) {
+            if (sCurrentPage.load() != scene::CavePage::Main || sModalDialogueActive.load()) {
+                logger().info("[AnimatedMojang] Route ", route, " -> Main vista");
+                returnToMainPage();
+            }
+            return;
+        }
+        if (sCurrentPage.load() != *page || sIsStartScreen.load() || sModalDialogueActive.load()) {
+            logger().info("[AnimatedMojang] Route ", route, " -> Page ", static_cast<int>(*page));
+            enterSubPage(*page);
+        }
+        return;
+    }
+
+    // A route without a vista of its own that is still a modal popup: hide the title while it is up.
+    static constexpr const char* kModalWords[] = {"modal", "popup", "dialog"};
+    for (const char* word : kModalWords) {
+        if (lower.find(word) != std::string::npos) {
+            if (sCurrentPage.load() == scene::CavePage::Main) {
+                logger().info("[AnimatedMojang] Modal route ", route, " -> title suppressed");
+                std::lock_guard guard(runtime.mutex);
+                setModalActive(true);
+                sIsStartScreen.store(false);
+            }
+            return;
+        }
+    }
+}
+
+static std::uintptr_t Hooked_Router_navigate(void* self, std::string const* route, int action) {
+    if (active.load()) {
+        std::string name;
+        if (readRouteString(route, name)) onRouteNavigate(name);
+    }
+    return sOriginalRouteNavigate ? sOriginalRouteNavigate(self, route, action) : 0;
+}
+
+// 2m. ClientInstance::update(isInitFinished, allowGameUpdate) -> bool
+// Saves the ClientInstance (only once the game finished initializing) and, after the real update, asks
+// ClientInstance::getScreenName() (vtable slot) for the current screen so pause_screen and
+// modal_progress_screen can show the replacement logo.
+using ClientUpdateFn = bool (*)(void*, bool, bool);
+static ClientUpdateFn sOriginalClientUpdate = nullptr;
+using GetScreenNameFn = std::string (*)(void*);
+static GetScreenNameFn sGetScreenName = nullptr;
+
+static ScreenKind classifyScreen(std::string_view name, ScreenKind previous) {
+    const std::string_view base = name.substr(0, name.find(" - "));
+    if (base == "start_screen") return ScreenKind::Start;
+    if (name.find("pause_screen") != std::string_view::npos) return ScreenKind::Pause;
+    if (name.find("world_saving_progress_screen") != std::string_view::npos
+        || name.find("world_loading_progress_screen") != std::string_view::npos) return ScreenKind::Progress;
+    // The Social drawer sits on top of the Start Menu: it keeps the replacement title.
+    if (previous == ScreenKind::Start && scene::isSocialDrawerScreen(name)) return ScreenKind::Start;
+    return ScreenKind::Other;
+}
+
+static bool Hooked_ClientInstance_update(void* self, bool isInitFinished, bool allowGameUpdate) {
+    if (active.load() && isInitFinished && self && sClientInstance.load(std::memory_order_relaxed) != self) {
+        sClientInstance.store(self);
+        logger().info("[AnimatedMojang] ClientInstance saved: ", self);
+    }
+    const bool result = sOriginalClientUpdate ? sOriginalClientUpdate(self, isInitFinished, allowGameUpdate) : false;
+
+    if (active.load(std::memory_order_relaxed) && sGetScreenName) {
+        void* instance = sClientInstance.load(std::memory_order_relaxed);
+        if (instance) {
+            const std::string name = sGetScreenName(instance);
+            const auto previous = static_cast<ScreenKind>(sScreenKind.load(std::memory_order_relaxed));
+            const ScreenKind kind = classifyScreen(name, previous);
+            if (kind != previous) {
+                sScreenKind.store(static_cast<int>(kind));
+                logger().info("[AnimatedMojang] Screen '", name, "' -> kind ", static_cast<int>(kind));
+            }
+        }
+    }
+    return result;
 }
 
 // 3. ProgressBarRenderer::$render
@@ -587,39 +602,41 @@ static bool safeExtractPath(const void* pathPtr, std::string& outPath) noexcept 
     return false;
 }
 
-using PackGetAssetFn = bool (*)(void*, void*, std::string&, bool);
+using PackGetAssetFn = bool (*)(void*, const ::Core::PathView&, std::string&, bool);
 static PackGetAssetFn sOriginalDirectoryPackGetAsset = nullptr;
 static PackGetAssetFn sOriginalZipPackGetAsset = nullptr;
 
-static bool shouldInterceptAsset(const std::string& p) {
-    if (p.find("textures/ui/title") != std::string::npos) return true;
-    if (p.find("textures/ui/panorama") != std::string::npos) return true;
+static bool shouldInterceptAsset(std::string_view p) {
+    // Hot path (every pack asset lookup): no allocation, one cheap prefilter first.
+    constexpr std::string_view kUi = "textures/ui/";
+    const auto ui = p.find(kUi);
+    if (ui == std::string_view::npos) return false;
+    const std::string_view rest = p.substr(ui + kUi.size());
+    if (rest.starts_with("title")) return sInterceptTitleTexture.load(std::memory_order_relaxed);
+    if (rest.starts_with("panorama")) return true;
     return false;
 }
 
-static bool handlePackAsset(void* self, void* pathPtr, std::string& outBuffer, bool loadMode, PackGetAssetFn orig) noexcept {
-    std::string path;
-    safeExtractPath(pathPtr, path);
-
+static bool handlePackAsset(void* self, const ::Core::PathView& packRelativePath, std::string& outBuffer, bool loadMode, PackGetAssetFn orig) noexcept {
     // Suppress vanilla static title and cubemap/panorama textures with transparent 16x16 PNG
     // Zero Resource Pack requirement - purely intercepts in-memory asset queries
-    if (!path.empty() && shouldInterceptAsset(path)) {
+    if (!packRelativePath.empty() && shouldInterceptAsset(packRelativePath.getUtf8StringView())) {
         outBuffer.assign(reinterpret_cast<const char*>(kTransparentPng), sizeof(kTransparentPng));
         return true;
     }
 
     if (orig) {
-        return orig(self, pathPtr, outBuffer, loadMode);
+        return orig(self, packRelativePath, outBuffer, loadMode);
     }
     return false;
 }
 
-static bool Hooked_DirectoryPack_getAsset(void* self, void* pathPtr, std::string& outBuffer, bool loadMode) noexcept {
-    return handlePackAsset(self, pathPtr, outBuffer, loadMode, sOriginalDirectoryPackGetAsset);
+static bool Hooked_DirectoryPack_getAsset(void* self, const ::Core::PathView& packRelativePath, std::string& outBuffer, bool loadMode) noexcept {
+    return handlePackAsset(self, packRelativePath, outBuffer, loadMode, sOriginalDirectoryPackGetAsset);
 }
 
-static bool Hooked_ZipPack_getAsset(void* self, void* pathPtr, std::string& outBuffer, bool loadMode) noexcept {
-    return handlePackAsset(self, pathPtr, outBuffer, loadMode, sOriginalZipPackGetAsset);
+static bool Hooked_ZipPack_getAsset(void* self, const ::Core::PathView& packRelativePath, std::string& outBuffer, bool loadMode) noexcept {
+    return handlePackAsset(self, packRelativePath, outBuffer, loadMode, sOriginalZipPackGetAsset);
 }
 
 // 9. glColorMask via GOT Relocation Hook
@@ -642,6 +659,12 @@ static void renderMenuFrame(float width, float height, double time) {
 
     // GL object creation + bounded texture streaming; never blocks on disk or decoding.
     const bool rendererReady = R.caveRenderer.prepare();
+
+    // A heuristic modal can miss its close event; never hide the title because of it for long.
+    if (sModalDialogueActive.load() && time - sModalSinceMs.load() > kModalMaxHideMs) {
+        logger().info("[AnimatedMojang] Modal flag expired -> title restored.");
+        sModalDialogueActive.store(false);
+    }
 
     Frame frame;
     scene::CaveCameraFrame cam;
@@ -681,7 +704,13 @@ static void renderMenuFrame(float width, float height, double time) {
     params.view = scene::caveView(cam.pose, motionTime);
 
     // Title: only on the main start screen, never over dialogues or sub-screens.
-    const bool isStartScreenActive = sIsStartScreen.load() && !sModalDialogueActive.load() && page == scene::CavePage::Main;
+    // The screen name from ClientInstance::getScreenName decides ("start_screen"); the flag heuristics are only
+    // the fallback while no name is available (ClientInstance not saved yet or getScreenName unresolved).
+    const auto screenKind = static_cast<ScreenKind>(sScreenKind.load(std::memory_order_relaxed));
+    const bool startByState = screenKind == ScreenKind::Unknown
+        ? (sIsStartScreen.load() && !sModalDialogueActive.load())
+        : screenKind == ScreenKind::Start;
+    const bool isStartScreenActive = startByState && page == scene::CavePage::Main;
     if (isStartScreenActive && frame.titleFrame >= 0 && R.config.minecraftTitleAnimation) {
         float alpha = cam.titleAlpha;
         if (frame.phase == Phase::MenuOpening && frame.elapsedMs < kUiRevealMs)
@@ -726,14 +755,16 @@ static void Hooked_glClear(GLbitfield mask) {
         return;
     }
 
-    GLint vp[4] = {0, 0, 0, 0};
-    glGetIntegerv(GL_VIEWPORT, vp);
-    if (vp[2] < 400 || vp[3] < 300) return; // ignore small offscreen targets
-
     const double time = nowMs();
     static double sLastRenderMs = 0.0;
     if (time - sLastRenderMs < 1.0) return; // several clears per frame: draw once per burst (works at 120/144/165 Hz)
+
+    GLint vp[4] = {0, 0, 0, 0};
+    glGetIntegerv(GL_VIEWPORT, vp);
+    if (vp[2] < 400 || vp[3] < 300) return; // ignore small offscreen targets
     sLastRenderMs = time;
+    sViewportW.store(vp[2], std::memory_order_relaxed);
+    sViewportH.store(vp[3], std::memory_order_relaxed);
 
     renderMenuFrame(static_cast<float>(vp[2]), static_cast<float>(vp[3]), time);
 }
@@ -743,7 +774,8 @@ using EglSwapBuffersFn = EGLBoolean (*)(EGLDisplay, EGLSurface);
 static EglSwapBuffersFn sOriginalEglSwapBuffers = nullptr;
 
 static EGLBoolean Hooked_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
-    if (sSuppressUiDrawing.load() && sOriginalGlColorMask) sOriginalGlColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    if (sSuppressUiDrawing.load(std::memory_order_relaxed) && sOriginalGlColorMask)
+        sOriginalGlColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 
     // Slow fade-in of the start screen buttons (6.0s -> 7.5s): lock-free, uses the published snapshot.
     if (active.load() && !sIsInWorld.load() && sCurrentPage.load() == scene::CavePage::Main
@@ -752,292 +784,169 @@ static EGLBoolean Hooked_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
         if (elapsed >= kUiRevealMs && elapsed < kUiFadeEndMs) {
             const float progress = std::clamp(static_cast<float>((elapsed - kUiRevealMs) / (kUiFadeEndMs - kUiRevealMs)), 0.0f, 1.0f);
             const float smooth = progress * progress * (3.0f - 2.0f * progress);
-            GLint vp[4] = {0, 0, 0, 0};
-            glGetIntegerv(GL_VIEWPORT, vp);
-            if (vp[2] > 0 && vp[3] > 0)
-                runtime.caveRenderer.renderFadeOverlay(static_cast<float>(vp[2]), static_cast<float>(vp[3]), 1.0f - smooth);
+            const int w = sViewportW.load(std::memory_order_relaxed), h = sViewportH.load(std::memory_order_relaxed);
+            if (w > 0 && h > 0)
+                runtime.caveRenderer.renderFadeOverlay(static_cast<float>(w), static_cast<float>(h), 1.0f - smooth);
         }
+    }
+    // Pause screen / world saving+loading progress screens: replacement logo on top of the finished frame,
+    // placed exactly where the original logo of that screen is.
+    const auto overlayKind = static_cast<ScreenKind>(sScreenKind.load(std::memory_order_relaxed));
+    if ((overlayKind == ScreenKind::Pause || overlayKind == ScreenKind::Progress) && active.load(std::memory_order_relaxed)) {
+        EGLint w = 0, h = 0;
+        if (eglQuerySurface(dpy, surf, EGL_WIDTH, &w) && eglQuerySurface(dpy, surf, EGL_HEIGHT, &h) && w >= 400 && h >= 300)
+            runtime.caveRenderer.renderTitleOverlay(static_cast<float>(w), static_cast<float>(h), 1.0f,
+                overlayKind == ScreenKind::Pause ? scene::kTitleLayoutPause : scene::kTitleLayoutProgress);
     }
     return sOriginalEglSwapBuffers ? sOriginalEglSwapBuffers(dpy, surf) : EGL_TRUE;
 }
 
-// Hooks are installed exactly once per process. Re-installing after stop()/start() would make the new
-// trampoline point at our own detour and recurse forever.
-static void installHooks() {
-    auto const& offsets = sOffsets;
-    logger().info("Installing Animated Mojang hooks via pattern signatures (detected: ", offsets.versionStr, ")...");
+// Hook failures are always logged with the reason (unresolved target, nmdk::hook error, GOT error).
+static std::vector<std::string> sFailedHooks;
 
-    static constexpr std::string_view kSigGetTechStack =
-        "FD 7B BD A9 F5 0B 00 F9 F4 4F 02 A9 FD 03 00 91 F4 03 01 AA F5 03 00 AA ?? ?? ?? 94 20 01 00 B4 F3 03 00 AA 00 1C 40 F9 40 01 00 B4";
-    static constexpr std::string_view kSigStartMenuOnOpen =
-        "FF ?? ?? D1 FD 7B ?? A9 FC 6F ?? A9 FA 67 ?? A9 F8 5F ?? A9 F6 57 ?? A9 F4 4F ?? A9 FD ?? 04 91 ?? D0 3B D5 D8 1B 98 52 F3 03 00 AA ?? 17 40 F9 B8 D5 BB 72 A8 03 1F F8 ?? ?? E0 97 60 F2 44 F9";
-    static constexpr std::string_view kSigStartMenuTick =
-        "FD 7B BA A9 FC 6F 01 A9 FA 67 02 A9 F8 5F 03 A9 F6 57 04 A9 F4 4F 05 A9 FD 03 00 91 FF 83 15 D1 57 D0 3B D5 F4 03 00 AA";
-    static constexpr std::string_view kSigPlayButton =
-        "FF 83 02 D1 FD 7B 07 A9 F6 57 08 A9 F4 4F 09 A9 FD C3 01 91 56 D0 3B D5 ?? ?? ?? ?? ?? ?? ?? ?? C8 16 40 F9 02 04 80 52 A8 83 1F F8 13 04 40 F9";
-    static constexpr std::string_view kSigSettingsButton =
-        "FF 43 02 D1 FD 7B 06 A9 F6 57 07 A9 F4 4F 08 A9 FD 83 01 91 56 D0 3B D5 ?? ?? ?? ?? ?? ?? ?? ?? C8 16 40 F9 82 04 80 52 A8 83 1F F8 13 04 40 F9";
-    static constexpr std::string_view kSigRealmsButton =
-        "FF 43 02 D1 FD 7B 06 A9 F6 57 07 A9 F4 4F 08 A9 FD 83 01 91 56 D0 3B D5 C8 16 40 F9 A8 83 1F F8 13 04 40 F9 E0 03 13 AA";
-    static constexpr std::string_view kSigDressingRoomButton =
-        "FF 43 02 D1 FD 7B 06 A9 F6 57 07 A9 F4 4F 08 A9 FD 83 01 91 56 D0 3B D5 ?? ?? ?? ?? ?? ?? ?? ?? C8 16 40 F9 02 05 80 52 A8 83 1F F8 13 04 40 F9 E0 23 00 91 74 6E 44 F9 ?? ?? ?? ?? 00 E4 00 6F 08 F0 A7 52 E8 43 00 B9 E0 03 01 AD E1 23 00 91 E2 83 00 91 E0 03 14 AA ?? ?? ?? ?? F4 1B 40 F9 94 02 00 B5";
-    static constexpr std::string_view kSigSkinsMenuButton =
-        "FF 83 03 D1 FD 7B 0B A9 F6 57 0C A9 F4 4F 0D A9 FD C3 02 91 56 D0 3B D5 ?? ?? ?? ?? ?? ?? ?? ?? C8 16 40 F9 A2 04 80 52 A8 83 1F F8 13 04 40 F9";
-    static constexpr std::string_view kSigMarketplaceButton =
-        "FF 83 03 D1 FD 7B 0B A9 F6 57 0C A9 F4 4F 0D A9 FD C3 02 91 56 D0 3B D5 ?? ?? ?? ?? ?? ?? ?? ?? C8 16 40 F9 E2 04 80 52 A8 83 1F F8 13 04 40 F9";
-    static constexpr std::string_view kSigAchievementsButton =
-        "FF 43 02 D1 FD 7B 06 A9 F6 57 07 A9 F4 4F 08 A9 FD 83 01 91 56 D0 3B D5 ?? ?? ?? ?? ?? ?? ?? ?? C8 16 40 F9 02 05 80 52 A8 83 1F F8 13 04 40 F9 E0 23 00 91 74 6E 44 F9 ?? ?? ?? ?? 00 E4 00 6F 08 F0 A7 52 E8 43 00 B9 E0 03 01 AD E1 23 00 91 E2 83 00 91 E0 03 14 AA ?? ?? ?? ?? F4 1B 40 F9 34 09 00 B5";
-    static constexpr std::string_view kSigFeedbackButton =
-        "FF 43 07 D1 FD 7B 17 A9 FC 6F 18 A9 FA 67 19 A9 F8 5F 1A A9 F6 57 1B A9 F4 4F 1C A9 FD C3 05 91 57 D0 3B D5 ?? ?? ?? ?? ?? ?? ?? ?? E8 16 40 F9 82 04 80 52";
-    static constexpr std::string_view kSigFeedbackButtonLegacy =
-        "FD 7B BA A9 FC 6F 01 A9 FA 67 02 A9 F8 5F 03 A9 F6 57 04 A9 F4 4F 05 A9 FD 03 00 91 FF 03 07 D1 57 D0 3B D5 ?? ?? ?? ?? ?? ?? ?? ?? E8 16 40 F9 82 04 80 52 A8 83 1F F8 14 04 40 F9 A0 03 01 D1";
-    static constexpr std::string_view kSigSignInButton =
-        "FF 43 02 D1 FD 7B 06 A9 F6 57 07 A9 F4 4F 08 A9 FD 83 01 91 55 D0 3B D5 ?? ?? ?? ?? ?? ?? ?? ?? A8 16 40 F9 42 04 80 52 A8 83 1F F8 13 04 40 F9";
-    static constexpr std::string_view kSigMenuExit =
-        "FD 7B BE A9 F3 0B 00 F9 FD 03 00 91 09 04 40 F9 F3 03 08 AA 20 6D 44 F9 ?? ?? ?? 97 ?? ?? ?? ?? ?? ?? ?? 91 ?? ?? ?? ?? ?? ?? ?? 91 1F 00 00 72 0A 02 80 52 4B 03 80 52";
-    static constexpr std::string_view kSigProgressBar =
-        "FF 03 05 D1 EF 3B 0A 6D ED 33 0B 6D EB 2B 0C 6D E9 23 0D 6D FD 7B 0E A9 FC 6F 0F A9 FA 67 10 A9 F8 5F 11 A9 F6 57 12 A9 F4 4F 13 A9 FD 83 03 91 48 D0 3B D5 F5 03 00 AA E0 03 03 AA E8 0F 00 F9";
-    static constexpr std::string_view kSigInGameHud =
-        "FF C3 01 D1 FD 7B 03 A9 F7 23 00 F9 F6 57 05 A9 F4 4F 06 A9 FD C3 00 91 57 D0 3B D5 F4 03 02 AA F3 03 01 AA E8 16 40 F9 F5 03 00 AA A8 83 1F F8 ?? ?? ?? ?? ?? ?? ?? 91 08 FD DF 08 88 10 00 36";
-    static constexpr std::string_view kSigLeaveGame =
-        "FF 43 04 D1 FD 7B 0C A9 FC 67 0D A9 F8 5F 0E A9 F6 57 0F A9 F4 4F 10 A9 FD 03 03 91 58 D0 3B D5 F7 03 02 2A F6 03 00 AA";
-    static constexpr std::string_view kSigPanorama =
-        "ED 33 B7 6D EB 2B 01 6D E9 23 02 6D FD 7B 03 A9 FC 23 00 F9 FA 67 05 A9 F8 5F 06 A9 F6 57 07 A9 F4 4F 08 A9 FD C3 00 91 FF 83 13 D1 59 D0 3B D5";
-    static constexpr std::string_view kSigCubemap =
-        "FF 03 02 D1 FD 7B 04 A9 F7 2B 00 F9 F6 57 06 A9 F4 4F 07 A9 FD 03 01 91 56 D0 3B D5 D7 1B 98 52 F4 03 00 AA C8 16 40 F9";
-    static constexpr std::string_view kSigDirectoryPack =
-        "FD 7B BA A9 FC 0B 00 F9 FA 67 02 A9 F8 5F 03 A9 F6 57 04 A9 F4 4F 05 A9 FD 03 00 91 FF C3 31 D1 59 D0 3B D5 F3 03 02 AA";
-    static constexpr std::string_view kSigZipPack =
-        "FD 7B BA A9 FC 6F 01 A9 FA 67 02 A9 F8 5F 03 A9 F6 57 04 A9 F4 4F 05 A9 FD 03 00 91 FF C3 33 D1 59 D0 3B D5 F4 03 02 AA";
-
-    ll::memory::precacheSignatures({
-        std::string(kSigGetTechStack),
-        std::string(kSigStartMenuOnOpen),
-        std::string(kSigStartMenuTick),
-        std::string(kSigPlayButton),
-        std::string(kSigSettingsButton),
-        std::string(kSigRealmsButton),
-        std::string(kSigDressingRoomButton),
-        std::string(kSigSkinsMenuButton),
-        std::string(kSigMarketplaceButton),
-        std::string(kSigAchievementsButton),
-        std::string(kSigFeedbackButton),
-        std::string(kSigFeedbackButtonLegacy),
-        std::string(kSigSignInButton),
-        std::string(kSigMenuExit),
-        std::string(kSigProgressBar),
-        std::string(kSigInGameHud),
-        std::string(kSigLeaveGame),
-        std::string(kSigPanorama),
-        std::string(kSigCubemap),
-        std::string(kSigDirectoryPack),
-        std::string(kSigZipPack)
-    });
-
-    // Hook 1: Force JSON UI for start menu screens
-    // RVAs: 1.26.52.3: 0x0974E844 | 1.26.51.1: 0x0974E7A4 | 1.26.45.1: 0x0938B714 | 1.26.44.3: 0x0938B7B4
-    // [RVA Hook - Commented Out]: ll::memory::hookRva(offsets.getTechStackForScreen, ...);
-    ll::memory::hookSignature(std::string(kSigGetTechStack),
-                              reinterpret_cast<void*>(&Hooked_ScreenTechStackSelector_getTechStackForScreen),
-                              reinterpret_cast<void**>(&sOriginalGetTechStack),
-                              offsets.getTechStackForScreen);
-
-    // Hook 2: StartMenuScreenController::$onOpen
-    // RVAs: 1.26.52.3: 0x0A2DF314 | 1.26.51.1: 0x0A2DF2A4 | 1.26.45.1: 0x09EBD95C | 1.26.44.3: 0x09EBD9FC
-    // [RVA Hook - Commented Out]: ll::memory::hookRva(offsets.startMenuOnOpen, ...);
-    ll::memory::hookSignature(std::string(kSigStartMenuOnOpen),
-                              reinterpret_cast<void*>(&Hooked_StartMenuScreenController_onOpen),
-                              reinterpret_cast<void**>(&sOriginalMenuOpen),
-                              offsets.startMenuOnOpen);
-
-    // Hook 2b: StartMenuScreenController::$tick
-    // RVAs: 1.26.52.3: 0x0A2E1FF4 | 1.26.51.1: 0x0A2E1F84 | 1.26.45.1: 0x09EC05D8 | 1.26.44.3: 0x09EC0678
-    // [RVA Hook - Commented Out]: ll::memory::hookRva(offsets.startMenuTick, ...);
-    ll::memory::hookSignature(std::string(kSigStartMenuTick),
-                              reinterpret_cast<void*>(&Hooked_StartMenuScreenController_tick),
-                              reinterpret_cast<void**>(&sOriginalMenuTick),
-                              offsets.startMenuTick);
-
-    // Hook 2c-2k: StartMenu Navigation Buttons (With camera glides and log feedback)
-    // Play Button
-    // RVAs: 1.26.52.3: 0x0A31344C | 1.26.51.1: 0x0A3133DC | 1.26.45.1: 0x09EF3D64 | 1.26.44.3: 0x09EF3E04
-    // [RVA Hook - Commented Out]: ll::memory::hookRva(offsets.playButton, ...);
-    ll::memory::hookSignature(std::string(kSigPlayButton),
-                              reinterpret_cast<void*>(&ButtonHook<0>::hooked),
-                              reinterpret_cast<void**>(&ButtonHook<0>::original),
-                              offsets.playButton);
-
-    // Settings Button
-    // RVAs: 1.26.52.3: 0x0A3171AC | 1.26.51.1: 0x0A31713C | 1.26.45.1: 0x09EF72C0 | 1.26.44.3: 0x09EF7360
-    // [RVA Hook - Commented Out]: ll::memory::hookRva(offsets.settingsButton, ...);
-    ll::memory::hookSignature(std::string(kSigSettingsButton),
-                              reinterpret_cast<void*>(&ButtonHook<1>::hooked),
-                              reinterpret_cast<void**>(&ButtonHook<1>::original),
-                              offsets.settingsButton);
-
-    // Realms Button
-    // RVAs: 1.26.52.3: 0x0A3174DC | 1.26.51.1: 0x0A31746C | 1.26.45.1: 0x09EF75F0 | 1.26.44.3: 0x09EF7690
-    // [RVA Hook - Commented Out]: ll::memory::hookRva(offsets.realmsButton, ...);
-    ll::memory::hookSignature(std::string(kSigRealmsButton),
-                              reinterpret_cast<void*>(&ButtonHook<2>::hooked),
-                              reinterpret_cast<void**>(&ButtonHook<2>::original),
-                              offsets.realmsButton);
-
-    // Dressing Room Button
-    // RVAs: 1.26.52.3: 0x0A31815C | 1.26.51.1: 0x0A3180EC | 1.26.45.1: 0x09EF8270 | 1.26.44.3: 0x09EF8310
-    // [RVA Hook - Commented Out]: ll::memory::hookRva(offsets.dressingRoomButton, ...);
-    ll::memory::hookSignature(std::string(kSigDressingRoomButton),
-                              reinterpret_cast<void*>(&ButtonHook<3>::hooked),
-                              reinterpret_cast<void**>(&ButtonHook<3>::original),
-                              offsets.dressingRoomButton);
-
-    // Skins Menu Button
-    // RVAs: 1.26.52.3: 0x0A317C1C | 1.26.51.1: 0x0A317BAC | 1.26.45.1: 0x09EF7D30 | 1.26.44.3: 0x09EF7DD0
-    // [RVA Hook - Commented Out]: ll::memory::hookRva(offsets.skinsMenuButton, ...);
-    ll::memory::hookSignature(std::string(kSigSkinsMenuButton),
-                              reinterpret_cast<void*>(&ButtonHook<4>::hooked),
-                              reinterpret_cast<void**>(&ButtonHook<4>::original),
-                              offsets.skinsMenuButton);
-
-    // Marketplace Button
-    // RVAs: 1.26.52.3: 0x0A3187A4 | 1.26.51.1: 0x0A318734 | 1.26.45.1: 0x09EF88A4 | 1.26.44.3: 0x09EF8944
-    // [RVA Hook - Commented Out]: ll::memory::hookRva(offsets.marketplaceButton, ...);
-    ll::memory::hookSignature(std::string(kSigMarketplaceButton),
-                              reinterpret_cast<void*>(&ButtonHook<5>::hooked),
-                              reinterpret_cast<void**>(&ButtonHook<5>::original),
-                              offsets.marketplaceButton);
-
-    // Achievements Button
-    // RVAs: 1.26.52.3: 0x0A316978 | 1.26.51.1: 0x0A316908 | 1.26.45.1: 0x09EF69E4 | 1.26.44.3: 0x09EF6A84
-    // [RVA Hook - Commented Out]: ll::memory::hookRva(offsets.achievementsButton, ...);
-    ll::memory::hookSignature(std::string(kSigAchievementsButton),
-                              reinterpret_cast<void*>(&ButtonHook<6>::hooked),
-                              reinterpret_cast<void**>(&ButtonHook<6>::original),
-                              offsets.achievementsButton);
-
-    // Feedback Button
-    // RVAs: 1.26.52.3: 0x0A314D58 | 1.26.51.1: 0x0A314CE8 | 1.26.45.1: 0x09EF52FC | 1.26.44.3: 0x09EF539C
-    // [RVA Hook - Commented Out]: ll::memory::hookRva(offsets.feedbackButton, ...);
-    uintptr_t fbAddr = ll::memory::findSignature(std::string(kSigFeedbackButton));
-    if (!fbAddr) {
-        fbAddr = ll::memory::findSignature(std::string(kSigFeedbackButtonLegacy));
+template <typename Detour, typename Function>
+bool installInlineHook(nmdk::memory::Address moduleBase, const char* name,
+                       signatures::Resolution const& resolution, Detour detour, Function& original) {
+    if (!resolution) {
+        logger().error("Hook FAILED [", name, "]: target not resolved - ", resolution.failure);
+        sFailedHooks.push_back(std::string(name) + ": target not resolved");
+        return false;
     }
-    if (fbAddr) {
-        uintptr_t base = ll::memory::getMinecraftBase();
-        uintptr_t rva = base ? (fbAddr - base) : fbAddr;
-        char buf[96];
-        snprintf(buf, sizeof(buf), "[AnimatedMojang] Hooked signature at %p (RVA 0x%lx)", reinterpret_cast<void*>(fbAddr), rva);
-        logger().info(buf);
-        ll::memory::hook(reinterpret_cast<void*>(fbAddr),
-                         reinterpret_cast<void*>(&ButtonHook<7>::hooked),
-                         reinterpret_cast<void**>(&ButtonHook<7>::original));
+    const auto target = resolution.address;
+
+    nmdk::memory::Address trampoline = 0;
+    const auto result = nmdk::hook::hook(
+        target,
+        reinterpret_cast<nmdk::memory::Address>(detour),
+        &trampoline
+    );
+    // nmdk::hook::hook: 0 = success, -1 = failure.
+    if (result != 0) {
+        logger().error("Hook FAILED [", name, "]: nmdk::hook::hook returned ", result, " (expected 0) for target ",
+                       reinterpret_cast<void*>(target), " (", resolution.source,
+                       "); address not hookable, already hooked incompatibly, or out of trampoline range");
+        sFailedHooks.push_back(std::string(name) + ": nmdk::hook::hook returned " + std::to_string(result));
+        return false;
+    }
+    if (trampoline == 0) {
+        logger().error("Hook FAILED [", name, "]: nmdk::hook::hook succeeded (", result, ") but produced no trampoline for target ",
+                       reinterpret_cast<void*>(target), " (", resolution.source, ")");
+        sFailedHooks.push_back(std::string(name) + ": no trampoline");
+        return false;
+    }
+    original = reinterpret_cast<Function>(trampoline);
+    const auto rva = target >= moduleBase ? target - moduleBase : 0;
+    logger().info("Hooked ", name, " at ", reinterpret_cast<void*>(target),
+                  " (RVA 0x", std::hex, rva, std::dec, ", ", resolution.source, ")");
+    return true;
+}
+
+template <typename Detour, typename Function>
+bool installGotHook(const char* name, const char* symbol, Detour detour, Function& original) {
+    nmdk::memory::Address trampoline = 0;
+    const bool installed = nmdk::hook::hookGOT(
+        signatures::MinecraftLibrary,
+        symbol,
+        reinterpret_cast<nmdk::memory::Address>(detour),
+        &trampoline
+    );
+    if (!installed) {
+        logger().error("GOT hook FAILED [", name, "]: nmdk::hook::hookGOT returned false for symbol '", symbol,
+                       "' in ", signatures::MinecraftLibrary, " (symbol has no GOT entry in this library or the entry could not be patched)");
+        sFailedHooks.push_back(std::string(name) + ": hookGOT returned false");
+        return false;
+    }
+    if (trampoline == 0) {
+        logger().error("GOT hook FAILED [", name, "]: hookGOT succeeded but returned no original function for symbol '", symbol, "'");
+        sFailedHooks.push_back(std::string(name) + ": no original function");
+        return false;
+    }
+    original = reinterpret_cast<Function>(trampoline);
+    logger().info("Hooked GOT symbol: ", name, " (", symbol, ")");
+    return true;
+}
+
+bool installHooks() {
+    const auto moduleBase = nmdk::library::base(signatures::MinecraftLibrary);
+    if (!moduleBase) {
+        logger().error("Hooks NOT installed: ", signatures::MinecraftLibrary, " is not loaded (nmdk::library::base returned 0).");
+        return false;
+    }
+    if (nmdk::architecture() != nmdk::Architecture::AArch64) {
+        logger().error("Hooks NOT installed: unsupported process architecture, Animated Mojang requires AArch64.");
+        return false;
+    }
+
+    const auto resolved = signatures::resolveAll(signatures::MinecraftLibrary);
+    logger().info("Resolved ", resolved.matchedCount(), "/23 engine targets (11 via NMDK vtable resolver, 12 via signatures); installing NMDK hooks (",
+                  nmdk::version(), ")...");
+    sFailedHooks.clear();
+
+    bool complete = true;
+    complete &= installInlineHook(moduleBase, "ScreenTechStackSelector::getTechStackForScreen", resolved.getTechStack,
+                                  &Hooked_ScreenTechStackSelector_getTechStackForScreen, sOriginalGetTechStack);
+    complete &= installInlineHook(moduleBase, "StartMenuScreenController::onOpen", resolved.startMenuOnOpen,
+                                  &Hooked_StartMenuScreenController_onOpen, sOriginalMenuOpen);
+    complete &= installInlineHook(moduleBase, "StartMenuScreenController::tick", resolved.startMenuTick,
+                                  &Hooked_StartMenuScreenController_tick, sOriginalMenuTick);
+    complete &= installInlineHook(moduleBase, "StartMenu Play button", resolved.playButton,
+                                  &ButtonHook<0>::hooked, ButtonHook<0>::original);
+    complete &= installInlineHook(moduleBase, "StartMenu Settings button", resolved.settingsButton,
+                                  &ButtonHook<1>::hooked, ButtonHook<1>::original);
+    complete &= installInlineHook(moduleBase, "StartMenu Realms button", resolved.realmsButton,
+                                  &ButtonHook<2>::hooked, ButtonHook<2>::original);
+    complete &= installInlineHook(moduleBase, "StartMenu Dressing Room button", resolved.dressingRoomButton,
+                                  &ButtonHook<3>::hooked, ButtonHook<3>::original);
+    complete &= installInlineHook(moduleBase, "StartMenu Skins button", resolved.skinsMenuButton,
+                                  &ButtonHook<4>::hooked, ButtonHook<4>::original);
+    complete &= installInlineHook(moduleBase, "StartMenu Marketplace button", resolved.marketplaceButton,
+                                  &ButtonHook<5>::hooked, ButtonHook<5>::original);
+    complete &= installInlineHook(moduleBase, "StartMenu Achievements button", resolved.achievementsButton,
+                                  &ButtonHook<6>::hooked, ButtonHook<6>::original);
+    complete &= installInlineHook(moduleBase, "StartMenu Feedback button", resolved.feedbackButton,
+                                  &ButtonHook<7>::hooked, ButtonHook<7>::original);
+    complete &= installInlineHook(moduleBase, "StartMenu Sign In button", resolved.signInButton,
+                                  &ButtonHook<8>::hooked, ButtonHook<8>::original);
+    complete &= installInlineHook(moduleBase, "Menu exit", resolved.menuExit,
+                                  &Hooked_Menu_Exit, sOriginalMenuExit);
+    complete &= installInlineHook(moduleBase, "OreUI Router::navigate", resolved.routeNavigate,
+                                  &Hooked_Router_navigate, sOriginalRouteNavigate);
+    complete &= installInlineHook(moduleBase, "ProgressBarRenderer::render", resolved.progressBar,
+                                  &Hooked_ProgressBarRenderer_render, sOriginalProgressRender);
+    complete &= installInlineHook(moduleBase, "inGamePlayScreenRender", resolved.inGameHud,
+                                  &Hooked_inGamePlayScreenRender, sOriginalInGamePlayScreenRender);
+    complete &= installInlineHook(moduleBase, "ClientInstance::requestLeaveGame", resolved.leaveGame,
+                                  &Hooked_clientInstanceRequestLeaveGame, sOriginalClientInstanceRequestLeaveGame);
+    complete &= installInlineHook(moduleBase, "ClientInstance::update", resolved.clientUpdate,
+                                  &Hooked_ClientInstance_update, sOriginalClientUpdate);
+    if (resolved.clientGetScreenName) {
+        sGetScreenName = reinterpret_cast<GetScreenNameFn>(resolved.clientGetScreenName.address);
+        logger().info("Resolved ClientInstance::getScreenName at ", reinterpret_cast<void*>(resolved.clientGetScreenName.address),
+                      " (", resolved.clientGetScreenName.source, ")");
     } else {
-        ll::memory::hookRva(offsets.feedbackButton,
-                            reinterpret_cast<void*>(&ButtonHook<7>::hooked),
-                            reinterpret_cast<void**>(&ButtonHook<7>::original));
+        logger().error("Resolve FAILED [ClientInstance::getScreenName]: ", resolved.clientGetScreenName.failure);
+        sFailedHooks.push_back("ClientInstance::getScreenName: target not resolved");
+        complete = false;
     }
+    complete &= installInlineHook(moduleBase, "PanoramaRenderer::render", resolved.panorama,
+                                  &Hooked_PanoramaRenderer_render, sOriginalPanoramaRender);
+    complete &= installInlineHook(moduleBase, "CubemapBackgroundScreen::render", resolved.cubemap,
+                                  &Hooked_CubemapBackgroundScreen_render, sOriginalCubemapRender);
+    complete &= installInlineHook(moduleBase, "DirectoryPackAccessStrategy::getAsset", resolved.directoryPack,
+                                  &Hooked_DirectoryPack_getAsset, sOriginalDirectoryPackGetAsset);
+    complete &= installInlineHook(moduleBase, "ZipPackAccessStrategy::getAsset", resolved.zipPack,
+                                  &Hooked_ZipPack_getAsset, sOriginalZipPackGetAsset);
+    complete &= installGotHook("glClear", signatures::GlClear.data(), &Hooked_glClear, sOriginalGlClear);
+    complete &= installGotHook("glColorMask", signatures::GlColorMask.data(), &Hooked_glColorMask, sOriginalGlColorMask);
+    complete &= installGotHook("eglSwapBuffers", signatures::EglSwapBuffers.data(), &Hooked_eglSwapBuffers, sOriginalEglSwapBuffers);
 
-    // Sign-In Button
-    // RVAs: 1.26.52.3: 0x0A31972C | 1.26.51.1: 0x0A3196BC | 1.26.45.1: 0x09EF9888 | 1.26.44.3: 0x09EF9928
-    // [RVA Hook - Commented Out]: ll::memory::hookRva(offsets.signInButton, ...);
-    ll::memory::hookSignature(std::string(kSigSignInButton),
-                              reinterpret_cast<void*>(&ButtonHook<8>::hooked),
-                              reinterpret_cast<void**>(&ButtonHook<8>::original),
-                              offsets.signInButton);
-
-    // Menu Exit / Back Button
-    // RVAs: 1.26.52.3: 0x0A567540 | 1.26.51.1: 0x0A5674D0 | 1.26.45.1: 0x0A15248C | 1.26.44.3: 0x0A15252C
-    // [RVA Hook - Commented Out]: ll::memory::hookRva(offsets.menuExit, ...);
-    ll::memory::hookSignature(std::string(kSigMenuExit),
-                              reinterpret_cast<void*>(&Hooked_Menu_Exit),
-                              reinterpret_cast<void**>(&sOriginalMenuExit),
-                              offsets.menuExit);
-
-    // Hook 3: Loading Progress Bar
-    // RVAs: 1.26.52.3: 0x09685F70 | 1.26.51.1: 0x09685ED0 | 1.26.45.1: 0x092BEC2C | 1.26.44.3: 0x092BECCC
-    // [RVA Hook - Commented Out]: ll::memory::hookRva(offsets.progressBarRender, ...);
-    ll::memory::hookSignature(std::string(kSigProgressBar),
-                              reinterpret_cast<void*>(&Hooked_ProgressBarRenderer_render),
-                              reinterpret_cast<void**>(&sOriginalProgressRender),
-                              offsets.progressBarRender);
-
-    // Hook 4: In-Game HUD Render
-    // RVAs: 1.26.52.3: 0x09ACC828 | 1.26.51.1: 0x09ACC7A8 | 1.26.45.1: 0x0974066C | 1.26.44.3: 0x0974070C
-    // [RVA Hook - Commented Out]: ll::memory::hookRva(offsets.inGamePlayScreenRender, ...);
-    ll::memory::hookSignature(std::string(kSigInGameHud),
-                              reinterpret_cast<void*>(&Hooked_inGamePlayScreenRender),
-                              reinterpret_cast<void**>(&sOriginalInGamePlayScreenRender),
-                              offsets.inGamePlayScreenRender);
-
-    // Hook 5: ClientInstance::requestLeaveGame
-    // RVAs: 1.26.52.3: 0x09800FF8 | 1.26.51.1: 0x09800F58 | 1.26.45.1: 0x0943C430 | 1.26.44.3: 0x0943C4D0
-    // [RVA Hook - Commented Out]: ll::memory::hookRva(offsets.clientInstanceRequestLeaveGame, ...);
-    ll::memory::hookSignature(std::string(kSigLeaveGame),
-                              reinterpret_cast<void*>(&Hooked_clientInstanceRequestLeaveGame),
-                              reinterpret_cast<void**>(&sOriginalClientInstanceRequestLeaveGame),
-                              offsets.clientInstanceRequestLeaveGame);
-
-    // Hook 6: PanoramaRenderer::$render suppression
-    // RVAs: 1.26.52.3: 0x0967FA98 | 1.26.51.1: 0x0967F9F8 | 1.26.45.1: 0x092B8DC0 | 1.26.44.3: 0x092B8E60
-    // [RVA Hook - Commented Out]: ll::memory::hookRva(offsets.panoramaRender, ...);
-    ll::memory::hookSignature(std::string(kSigPanorama),
-                              reinterpret_cast<void*>(&Hooked_PanoramaRenderer_render),
-                              reinterpret_cast<void**>(&sOriginalPanoramaRender),
-                              offsets.panoramaRender);
-
-    // Hook 7: CubemapBackgroundScreen::$render suppression
-    // RVAs: 1.26.52.3: 0x09B7C9E0 | 1.26.51.1: 0x09B7C960 | 1.26.45.1: 0x097C99A4 | 1.26.44.3: 0x097C9A44
-    // [RVA Hook - Commented Out]: ll::memory::hookRva(offsets.cubemapBackgroundRender, ...);
-    ll::memory::hookSignature(std::string(kSigCubemap),
-                              reinterpret_cast<void*>(&Hooked_CubemapBackgroundScreen_render),
-                              reinterpret_cast<void**>(&sOriginalCubemapRender),
-                              offsets.cubemapBackgroundRender);
-
-    // Hook 8: DirectoryPackAccessStrategy & ZipPackAccessStrategy (Zero RP Asset Interception)
-    // DirectoryPack RVAs: 1.26.52.3: 0x111EEE94 | 1.26.51.1: 0x111EEA54 | 1.26.45.1: 0x1042D360 | 1.26.44.3: 0x1042D8C0
-    // [RVA Hook - Commented Out]: ll::memory::hookRva(offsets.directoryPackGetAsset, ...);
-    ll::memory::hookSignature(std::string(kSigDirectoryPack),
-                              reinterpret_cast<void*>(&Hooked_DirectoryPack_getAsset),
-                              reinterpret_cast<void**>(&sOriginalDirectoryPackGetAsset),
-                              offsets.directoryPackGetAsset);
-
-    // ZipPack RVAs: 1.26.52.3: 0x11158670 | 1.26.51.1: 0x11158230 | 1.26.45.1: 0x1040D528 | 1.26.44.3: 0x1040DA88
-    // [RVA Hook - Commented Out]: ll::memory::hookRva(offsets.zipPackGetAsset, ...);
-    ll::memory::hookSignature(std::string(kSigZipPack),
-                              reinterpret_cast<void*>(&Hooked_ZipPack_getAsset),
-                              reinterpret_cast<void**>(&sOriginalZipPackGetAsset),
-                              offsets.zipPackGetAsset);
-
-    // ========================================================================
-    // Dynamic ELF GOT Relocation Hooks (Auto-resolves across all versions)
-    // Hardcoded GOT RVAs are retained as reference comments per version.
-    // ========================================================================
-
-    // Hook 9: glClear GOT Relocation Hook
-    // GOT RVAs: 1.26.52.3: 0x132893d8 | 1.26.51.1: 0x13289078 | 1.26.45.1: 0x124C9688 | 1.26.44.3: 0x124C9D28
-    // [RVA Hook - Commented Out]: ll::memory::hookGotSlot(offsets.glClearGotRva, ...);
-    ll::memory::hookGotSymbol("glClear",
-                              reinterpret_cast<void*>(&Hooked_glClear),
-                              reinterpret_cast<void**>(&sOriginalGlClear),
-                              offsets.glClearGotRva);
-
-    // Hook 9b: glColorMask GOT Relocation Hook
-    // GOT RVAs: 1.26.52.3: 0x13289288 | 1.26.51.1: 0x13288f28 | 1.26.45.1: 0x124c9538 | 1.26.44.3: 0x124c9bd8
-    // [RVA Hook - Commented Out]: ll::memory::hookGotSlot(offsets.glColorMaskGotRva, ...);
-    ll::memory::hookGotSymbol("glColorMask",
-                              reinterpret_cast<void*>(&Hooked_glColorMask),
-                              reinterpret_cast<void**>(&sOriginalGlColorMask),
-                              offsets.glColorMaskGotRva);
-
-    // Hook 10: eglSwapBuffers GOT Relocation Hook
-    // GOT RVAs: 1.26.52.3: 0x132c7dc0 | 1.26.51.1: 0x132c7a60 | 1.26.45.1: 0x12507f20 | 1.26.44.3: 0x125085c0
-    // [RVA Hook - Commented Out]: ll::memory::hookGotSlot(offsets.eglSwapBuffersGotRva, ...);
-    ll::memory::hookGotSymbol("eglSwapBuffers",
-                              reinterpret_cast<void*>(&Hooked_eglSwapBuffers),
-                              reinterpret_cast<void**>(&sOriginalEglSwapBuffers),
-                              offsets.eglSwapBuffersGotRva);
-
-    logger().info("Animated Mojang v1.0.0 hooks installed successfully!");
+    if (complete) {
+        logger().info("All NMDK hooks installed successfully.");
+    } else {
+        logger().warn(sFailedHooks.size(), " NMDK hook(s) failed; the mod runs with the hooks that were installed. Failed:");
+        for (const auto& failed : sFailedHooks) logger().warn("  - ", failed);
+    }
+    return true;
 }
 
 static bool sHooksInstalled = false;
@@ -1050,6 +959,14 @@ void prepareCave(std::filesystem::path const& modDirectory) {
 
 void start(Config const& config, std::filesystem::path const& modDirectory) {
     if (active.load() || !config.enabled) return;
+
+    if (!sHooksInstalled) {
+        if (!installHooks()) {
+            logger().error("Startup aborted: required NMDK signatures or hooks could not be installed.");
+            return;
+        }
+        sHooksInstalled = true;
+    }
 
     {
         std::lock_guard guard(runtime.mutex);
@@ -1068,6 +985,7 @@ void start(Config const& config, std::filesystem::path const& modDirectory) {
         sMenuAlpha.store(0.f);
     }
     runtime.caveRenderer.configure(config.minecraftTitleAnimation, config.replayOnReturnToMenu);
+    sInterceptTitleTexture.store(config.minecraftTitleAnimation);
 
     active.store(true);
     sIsMainMenu.store(false);
@@ -1078,12 +996,6 @@ void start(Config const& config, std::filesystem::path const& modDirectory) {
     // CPU-only work (mesh, atlas, title metadata) starts right away on a low-priority thread so the
     // assets are ready before the first menu frame; GL objects are created on the render thread.
     prepareCave(modDirectory);
-
-    if (!sHooksInstalled) {
-        sHooksInstalled = true;
-        sOffsets = detectOffsets();
-        installHooks();
-    }
 }
 
 void stop() {
@@ -1091,6 +1003,7 @@ void stop() {
     skipRequested.store(false);
     skipAllowed.store(false);
     sSuppressUiDrawing.store(false);
+    sScreenKind.store(static_cast<int>(ScreenKind::Unknown));
     // The menu might still be waiting for the deferred construction; never leave it unbuilt.
     triggerPendingStartMenuConstruction();
     // GL objects can only be freed on the render thread: ask it to do so at its next glClear.

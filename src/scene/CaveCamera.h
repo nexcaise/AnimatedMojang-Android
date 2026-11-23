@@ -35,12 +35,33 @@ inline CavePose cavePagePose(CavePage page) {
     default: return caveTitle;
     }
 }
+// The Social drawer (friends list, invites, ...) is an overlay on top of the Start Menu: it neither moves
+// the camera nor hides the replacement title, so it never maps to a CavePage.
+inline bool isSocialDrawerRoute(std::string_view route) {
+    if (const auto hash = route.find('#'); hash != std::string_view::npos) route.remove_prefix(hash + 1);
+    route = route.substr(0, route.find_first_of("?#"));
+    const auto is = [&](std::string_view root) {
+        return route == root || (route.starts_with(root) && route.size() > root.size() && route[root.size()] == '/');
+    };
+    for (auto root : {"/friends-drawer", "/gifting-friends", "/add-friend", "/invites", "/activities",
+            "/blocklist", "/member-settings", "/people"})
+        if (is(root)) return true;
+    return false;
+}
+inline bool isSocialDrawerScreen(std::string_view name) {
+    name = name.substr(0, name.find(" - "));
+    std::string key;
+    for (unsigned char c : name) if (std::isalnum(c)) key += static_cast<char>(std::tolower(c));
+    return key.find("friendsdrawer") != std::string::npos || key.find("social") != std::string::npos
+        || key.find("gifting") != std::string::npos;
+}
 inline std::optional<CavePage> cavePageForScreen(std::string_view name) {
     // Explicit aliases only; loading, HUD and unknown modal screens retain the parent camera.
     std::string key;
     for (unsigned char c : name) if (std::isalnum(c)) key += static_cast<char>(std::tolower(c));
     // The SDL shell serves unrelated pages: inspect its annotation before trimming it.
     if (key.starts_with("nonscrollablesdlscreendressingroom")) return CavePage::DressingRoom;
+    if (isSocialDrawerScreen(name)) return std::nullopt; // overlay: keeps the current page and the title
     name = name.substr(0, name.find(" - "));
     key.clear();
     for (unsigned char c : name) if (std::isalnum(c)) key += static_cast<char>(std::tolower(c));
@@ -55,6 +76,7 @@ inline std::optional<CavePage> cavePageForScreen(std::string_view name) {
         || key.find("inbox") != std::string::npos) return CavePage::Settings;
     if (key == "skinselectorscreen" || key == "skinpickerscreen" || key == "personascreen"
         || key == "dressingroomscreen" || key == "dressingroom" || key == "profile"
+        || key.find("profile") != std::string::npos
         || key.find("persona") != std::string::npos || key.find("dressing") != std::string::npos) return CavePage::DressingRoom;
     if (key == "storedatadrivenscreen" || key == "storescreen" || key == "marketplacescreen"
         || key == "marketplace" || key == "store"
@@ -70,6 +92,7 @@ inline std::optional<CavePage> cavePageForRoute(std::string_view route) {
         return route == root || (route.starts_with(root) && route.size() > root.size() && route[root.size()] == '/');
     };
     if (is("/pre-start") || route == "/pre-start") return std::nullopt;
+    if (isSocialDrawerRoute(route)) return std::nullopt; // overlay: keeps the current page and the title
     if (is("/main-menu") || route == "start_screen" || route == "main_menu_screen") return CavePage::Main;
     if (is("/realms") || is("/realm") || is("/play/realms") || is("/join-realms-server") || is("/post-to-realm-stories") || route.find("realm") != std::string_view::npos) return CavePage::Realms;
     for (auto root : {"/realms-pdp", "/realms-plan-picker-v1", "/realms-plan-picker-v2", "/realms-choose-realm",

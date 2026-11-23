@@ -1,89 +1,67 @@
-# Animated Mojang — Setup & Usage Guide
+# Setup and development guide
 
-A setup and technical reference guide for **Animated Mojang (Android ARM64)**.
+## 1. Target requirements
 
-**Description**: `by SpyGamingOG`
+- Minecraft Bedrock Android with an `arm64-v8a` process.
+- Android API 28 or newer.
+- A loader that can load a native mod exposing `PLGetModRegistration` or `JNI_OnLoad`.
 
----
+The runtime is not pinned to Minecraft 1.26.52 or any other exact game version. It checks for known function signatures in the loaded `libminecraftpe.so`; only successfully resolved functions receive hooks. Newer versions, including 1.26.60+, can be supported by adding verified patterns to `src/client/Signatures.h` when Mojang changes the machine code.
 
-## 1. Quick Start Installation
+## 2. Install
 
-### Method A: LeviLauncher (Recommended)
-1. Copy or download **`animated_mojang.levipack`**.
-2. Open **LeviLauncher** -> **Mods** -> **Import** -> Select `animated_mojang.levipack`.
-3. Enable the mod in the list and launch Minecraft.
+1. Build or obtain `animated_mojang.levipack`.
+2. Import it through the mod import page in LeviLauncher/LeviLaunchroid.
+3. Ensure `libAnimatedMojang.so` is present in the mod directory after extraction. `libnmdk.so` is not in the package; NMDK must be provided by your launcher/loader.
+4. Enable the mod and launch the target Minecraft build.
+5. Check the mod log for `Installing NMDK hooks using executable signatures` and inspect any `NMDK signature not found` warnings.
 
-### Method B: Manual Deployment
-Extract `animated_mojang.levipack` (it is a standard ZIP archive) into your game or launcher directory:
+A missing signature means the function's current machine code does not match the patterns bundled with this source. Do not replace it with an unverified RVA. Extract a pattern from the exact target binary, verify its uniqueness and function boundary, then add it to the corresponding array in `src/client/Signatures.h`.
+
+## 3. Build from source
+
+The NMDK arm64-v8a headers and runtime are vendored in `vendor/nmdk/`.
+
 ```bash
-# Target path structure:
-<game_root>/mods/AnimatedMojang/
-├── libAnimatedMojang.so
-├── manifest.json
-└── tooth.json
+cmake -S . -B build -G Ninja \
+  -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+  -DANDROID_ABI=arm64-v8a \
+  -DANDROID_PLATFORM=android-28 \
+  -DANDROID_STL=c++_shared \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+tools/make_levipack.sh build/libAnimatedMojang.so dist/animated_mojang.levipack
 ```
 
----
+`package_mod.sh` wraps the configure/build/package steps for an environment where the Android NDK is available through CMake. Do not use a host x86-64 compiler to build the mod itself.
 
-## 2. Supported Versions
+## 4. Host tests
 
-- **Minecraft Bedrock 1.26.52.3**
-- **Minecraft Bedrock 1.26.51.1**
-- **Minecraft Bedrock 1.26.45.1**
-- **Minecraft Bedrock 1.26.44.3**
-- Future 1.26.x minor builds via universal AArch64 pattern signatures (`hookSignature`) and dynamic ELF GOT resolution.
-
----
-
-## 3. Configuration Reference
-
-The configuration file is automatically created at `mods/AnimatedMojang/config/config.json`:
-
-| Parameter | Type | Default | Description |
-|---|:---:|:---:|---|
-| `enabled` | boolean | `true` | Master mod toggle. |
-| `preferJsonMainMenu` | boolean | `false` | When false, renders the Minecraft title sequence directly via GPU. |
-| `minecraftTitleAnimation` | boolean | `true` | Enables the 69-frame animated title sequence. |
-| `caveBackground` | boolean | `true` | Enables real-time 3D OpenGL ES cave background rendering. |
-| `restyleLoadingProgress` | boolean | `true` | Restyles the game loading progress bar to Crimson theme. |
-| `replayOnReturnToMenu` | boolean | `true` | Replays the camera flight when returning from a world or sub-screen. |
-| `maxPresentationSeconds` | float | `15.0` | Maximum timeout before automatically falling back to idle. |
-| `blockMenuInputDuringIntro` | boolean | `true` | Blocks button clicks until camera flight and button fade-in complete. |
-
----
-
-## 4. Cinematic Intro & Transition Timeline
-
-- **0.0s – 4.0s (Camera Flight & Progressive Preload)**: 3D camera spline flight through the cave to the title viewpoint (`cameraFlightMs = 4000.0`). Start buttons and title remain hidden while 1 title texture strip is progressively uploaded to GPU VRAM every 350ms, guaranteeing zero hitching during playback.
-- **4.0s – 6.0s (Title Sequence)**: Camera holds at the title viewpoint while the hardware-accelerated animated Minecraft title plays across 69 frames (`titleDelayMs = 4000.0`) at 60/120 FPS.
-- **6.0s – 7.5s (Button Fade-In & VRAM Eviction)**: Unused animation strips 0 through 7 are purged from GPU VRAM to reclaim ~460 MB, retaining only resting strip 8. Start screen buttons appear and smoothly fade in over 1.5 seconds (`menuFadeMs = 1500.0`) via clean GPU background frame capture and smoothstep overlay blending.
-- **7.5s+ (Interactive Idle)**: Full interactive idle state with zero GPU overlay overhead.
-- **Sub-Menu Navigation**: Clicking Play, Settings, Realms, Dressing Room, or Marketplace triggers a smooth camera glide to dedicated viewpoints, while immediately hiding the title. Exiting any sub-menu smoothly glides back to Main and restores the title.
-
----
-
-## 5. Building from Source
-
-### Prerequisites
-- Linux x86_64, Android Termux, or WSL2.
-- Android NDK r25c+ (or clang 14+).
-- CMake 3.22+ and Ninja.
-
-### Build Command
 ```bash
-./package_mod.sh
+tests/host/run.sh
 ```
-This builds `libAnimatedMojang.so`, bundles the assets, and outputs `dist/animated_mojang.levipack`.
 
----
+These tests exercise CPU-side mesh/atlas handling and renderer robustness. They do not validate Minecraft function signatures, NMDK trampolines, loader integration, or runtime behaviour inside Minecraft.
 
-## 6. Architecture Highlights
+## 5. Hook integration notes
 
-1. **Zero Resource Pack (Zero RP)**: Functional memory detours directly suppress RenderDragon's vanilla 2D panorama and Ancient City cubemap.
-2. **Multi-Segment Memory Scanner**: Scans all readable and executable memory mappings in `/proc/self/maps` using `std::memchr`, eliminating issues with split ELF segments.
-3. **Dynamic ELF GOT Resolution**: Discovers GOT slots for `glClear`, `glColorMask`, and `eglSwapBuffers` at runtime via `PT_DYNAMIC` / `DT_JMPREL` relocation parsing, avoiding hardcoded GOT RVAs.
-4. **Adreno 740+ Offscreen FBO Compatibility**: Full preservation and restoration of active framebuffers (`GL_FRAMEBUFFER_BINDING`), ensuring 3D cave rendering succeeds on Snapdragon 8 Gen 2/3 devices (e.g., Red Magic 8 Pro) where RenderDragon uses offscreen render target FBOs.
-5. **Progressive Title Texture Preloading & VRAM Eviction**: Staggers the upload of heavy 57.6 MB title texture strips across the 4.0s camera flight (1 strip every 350ms) to eliminate frame-drop hitches, then immediately deletes intermediate strips 0–7 once resting at frame 68, reclaiming ~460 MB of VRAM.
-6. **Strict Start Screen & Sub-Menu Isolation**: Renders the animated title during `glClear` bound strictly to `sIsStartScreen && currentPage == Main && !sModalDialogueActive`. Internal transitional routes (`/pre-start`) are filtered out, guaranteeing that the title never bleeds into Settings, Play, or modal confirmation dialogues.
-7. **High-Refresh Display Frame Pacing**: Sub-millisecond render threshold guarantees jitter-free 120 Hz, 144 Hz, and 165 Hz presentation.
-8. **EGL Context Recovery & Memory Hardening**: Automatically detects Android EGL context invalidation on app switch or minimize, safely rebuilding shaders and VBOs without dead handle crashes, backed by W^X-compliant anonymous mmap trampolines.
+- `nmdk::library::base("libminecraftpe.so")` resolves the loaded game module.
+- `nmdk::signature::resolveSignatures()` resolves all patterns declared in the single header `src/client/Signatures.h` in one API call; the header selects the first matching variant for each function.
+- All inline hook patterns and graphics GOT symbol names are centralized in that header.
+- `nmdk::hook::hook()` installs inline hooks; `nmdk::hook::hookGOT()` installs graphics symbol hooks.
+- The AArch64 architecture and loaded-module checks are retained. There is no version string, GNU Build ID allowlist, or hardcoded game RVA check.
+- If a function signature is missing, that hook is skipped while other hooks are still attempted.
+- Hook installation is one-shot per process. Disable/enable does not chain duplicate trampolines.
+
+When supporting a new game version, append a verified pattern to the appropriate array in `Signatures.h`. No version-specific offset table or edits to `Client.cpp` should be necessary. Verify against that version's actual `libminecraftpe.so` that each pattern resolves exactly once and points to the intended function entry point before release.
+
+## 6. Package contents
+
+The LeviPack includes only runtime assets and the mod library:
+
+- `libAnimatedMojang.so`
+- `manifest.json`, `icon.png`
+- `config/config.json`
+- `resources/data/` and the baked title atlas
+
+The source-only title frame PNGs are removed from the final LeviPack because the baked atlas is what the renderer loads.

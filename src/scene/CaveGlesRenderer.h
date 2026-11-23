@@ -26,6 +26,17 @@ namespace animated_mojang::scene {
 //   * everything else: the render thread that owns the current EGL context (i.e. inside the glClear hook)
 // All file IO, PNG decoding, mesh de-duplication and alpha classification run on background threads;
 // the render thread only issues GL calls and never decodes an image.
+// Where the visible (outlined) logo sits on screen, as fractions of the screen. The values were measured
+// from screenshots of the original logo on each screen (2400x1080), so the replacement lands on top of it.
+struct TitleLayout {
+    float widthFrac; // visible logo width / screen width
+    float centerX;   // visible logo centre X / screen width
+    float centerY;   // visible logo centre Y / screen height
+};
+inline constexpr TitleLayout kTitleLayoutStart{0.5475f, 0.4992f, 0.2458f};    // start_screen
+inline constexpr TitleLayout kTitleLayoutProgress{0.5483f, 0.4994f, 0.1644f}; // world loading / saving progress
+inline constexpr TitleLayout kTitleLayoutPause{0.3504f, 0.2940f, 0.1338f};    // pause_screen (above the buttons)
+
 class CaveGlesRenderer {
 public:
     struct FrameParams {
@@ -34,6 +45,7 @@ public:
         double timeMs = 0;
         int titleFrame = -1;     // < 0: no title
         float titleAlpha = 1.f;
+        TitleLayout titleLayout = kTitleLayoutStart;
         bool captureBackground = false; // copy the finished cave+title into the fade texture
     };
 
@@ -58,6 +70,9 @@ public:
     bool prepare();
     bool drawFrame(FrameParams const& params);
     bool renderFadeOverlay(float screenWidth, float screenHeight, float overlayAlpha);
+    // Draws only the resting (final) title frame on top of the current frame, without the cave.
+    // Used for screens outside the Start Menu that must still show the replacement logo (pause, modal progress).
+    bool renderTitleOverlay(float screenWidth, float screenHeight, float alpha, TitleLayout const& layout);
     void destroy(bool contextLost);
 
 private:
@@ -134,6 +149,7 @@ private:
     // title streaming state
     std::vector<TitlePage> mPages;
     bool mTitleSettled = false;
+    bool mOverlayMode = false; // overlay draw in progress: stream only the resting page
     int mPriorityPage = -1;
     bool mWarnedTitle = false;
 

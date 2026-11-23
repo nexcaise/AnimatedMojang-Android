@@ -1,26 +1,14 @@
 {
   "type": "preload-native",
   "name": "AnimatedMojang",
-  "author": "SpyGamingOG",
-  "description": "by SpyGamingOG",
-  "version": "1.0.2",
+  "author": "NexCaise Team",
+  "description": "Animated Mojang Intro native mod powered by NMDK for Minecraft Bedrock Android arm64-v8a.",
+  "version": "2.3.2",
   "entry": "libAnimatedMojang.so",
   "icon": "icon.png",
   "dependencies": [],
   "minecraft_versions": [
-    "1.26.52.3",
-    "1.26.52.03",
-    "1.26.52.*",
-    "1.26.51.1",
-    "1.26.51.*",
-    "1.26.45.1",
-    "1.26.45.*",
-    "1.26.44.3",
-    "1.26.44.*",
-    "1.26.5X.*",
-    "1.26.5X.X",
     "1.26.*",
-    "1.26.X.X",
     "*"
   ]
 }

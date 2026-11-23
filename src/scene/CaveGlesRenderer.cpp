@@ -208,7 +208,7 @@ constexpr int kMaxTitlePagesInFlight = 2;   // bounds decoded-but-not-uploaded R
 // Placement of the resting logo (frame 68) inside the 2403x749 source frame. These numbers define the
 // on-screen layout and are independent of the atlas bake scale.
 constexpr float kLogoWidthPx = 1373.f, kLogoX = 518.f, kLogoY = 502.f;
-constexpr float kLogoScreenWidth = 0.477f, kLogoScreenTop = 0.130f;
+constexpr float kLogoHeightPx = 245.f; // visible resting-frame height (width is kLogoWidthPx)
 
 } // namespace
 
@@ -531,6 +531,7 @@ void CaveGlesRenderer::destroy(bool contextLost) {
 // Title page streaming: decode on a worker thread, upload a bounded number of rows per frame.
 // ================================================================================================
 bool CaveGlesRenderer::titlePagesWanted(int page) const {
+    if (mOverlayMode) return mTitleInfo && page == mTitleInfo->restingPage();
     if (mTitleSettled && !mKeepTitleResident.load()) return mTitleInfo && page == mTitleInfo->restingPage();
     return true;
 }
@@ -691,11 +692,13 @@ void CaveGlesRenderer::drawTitle(FrameParams const& p) {
         return;
     }
 
-    // Same layout rules as the original: logo is 47.7% of the screen width, top edge at 13% of the height.
-    const float targetWidth = p.width * kLogoScreenWidth;
+    // Place the visible logo exactly where the original one is drawn on this screen (see TitleLayout).
+    const float targetWidth = p.width * p.titleLayout.widthFrac;
     const float scale = targetWidth / kLogoWidthPx;
-    const float originX = (p.width - targetWidth) * 0.5f - kLogoX * scale;
-    const float originY = p.height * kLogoScreenTop - kLogoY * scale;
+    const float left = p.width * p.titleLayout.centerX - targetWidth * 0.5f;
+    const float top = p.height * p.titleLayout.centerY - kLogoHeightPx * scale * 0.5f;
+    const float originX = left - kLogoX * scale;
+    const float originY = top - kLogoY * scale;
     const float px = originX + static_cast<float>(frame.cx) * scale;
     const float py = originY + static_cast<float>(frame.cy) * scale;
     const float pw = static_cast<float>(frame.cw) * scale;
@@ -772,6 +775,29 @@ bool CaveGlesRenderer::renderFadeOverlay(float screenWidth, float screenHeight, 
     glViewport(0, 0, static_cast<GLsizei>(screenWidth), static_cast<GLsizei>(screenHeight));
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     drawFullscreenFade(overlayAlpha);
+    return true;
+}
+
+bool CaveGlesRenderer::renderTitleOverlay(float screenWidth, float screenHeight, float alpha, TitleLayout const& layout) {
+    if (!mTitleEnabled.load() || alpha <= 0.001f || !(screenWidth > 0.f) || !(screenHeight > 0.f)) return false;
+    mOverlayMode = true;
+    const bool ready = prepare() && mGlReady.load() && mTitleInfo;
+    if (!ready) {
+        mOverlayMode = false;
+        return false;
+    }
+    {
+        GlStateScope scope(/*withFramebuffer=*/true);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        FrameParams p;
+        p.width = screenWidth;
+        p.height = screenHeight;
+        p.titleFrame = mTitleInfo->restingFrame();
+        p.titleAlpha = alpha;
+        p.titleLayout = layout;
+        drawTitle(p); // streams the resting page on demand and skips the frame until it is resident
+    }
+    mOverlayMode = false;
     return true;
 }
 

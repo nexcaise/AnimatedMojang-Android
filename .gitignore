@@ -32,3 +32,6 @@ compile_commands.json
 
 # Distribution packages
 dist/
+
+# Bundled NMDK runtime is a required source dependency, not a build output.
+!vendor/nmdk/libs/arm64-v8a/libnmdk.so

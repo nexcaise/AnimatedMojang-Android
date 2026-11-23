@@ -1,13 +1,84 @@
 #include "mod/MyMod.h"
 #include "client/Client.h"
 
-#include <iostream>
-#include <fstream>
-#include <vector>
 #include <dlfcn.h>
+#include <cstdint>
+#include <exception>
+#include <fstream>
 #include <nlohmann/json.hpp>
+#include <system_error>
+#include <vector>
 
 namespace my_mod {
+namespace {
+
+constexpr const char* kLauncherProfiles =
+    "/sdcard/Android/media/org.levimc.launcher/minecraft";
+
+bool hasModResources(const std::filesystem::path& directory) {
+    std::error_code error;
+    return std::filesystem::is_regular_file(
+        directory / "resources" / "data" / "normal_cave.mesh", error);
+}
+
+std::vector<std::filesystem::path> findModDirectories() {
+    std::vector<std::filesystem::path> candidates;
+
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<void*>(&MyMod::getInstance), &info) && info.dli_fname) {
+        const auto libraryDirectory = std::filesystem::path(info.dli_fname).parent_path();
+        candidates.push_back(libraryDirectory);
+        candidates.push_back(libraryDirectory.parent_path());
+    }
+
+    std::error_code error;
+    const std::filesystem::path profiles(kLauncherProfiles);
+    if (std::filesystem::is_directory(profiles, error)) {
+        for (std::filesystem::directory_iterator it(profiles, error), end;
+             !error && it != end; it.increment(error)) {
+            std::error_code entryError;
+            if (it->is_directory(entryError)) {
+                candidates.push_back(it->path() / "mods" / "AnimatedMojang");
+            }
+        }
+    }
+
+    std::vector<std::filesystem::path> valid;
+    for (const auto& candidate : candidates) {
+        if (!candidate.empty() && hasModResources(candidate)) {
+            valid.push_back(candidate);
+        }
+    }
+    return valid;
+}
+
+void loadConfig(const std::filesystem::path& file, animated_mojang::Config& config,
+                Logger& logger) {
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(file, error)) return;
+
+    try {
+        std::ifstream input(file);
+        const auto json = nlohmann::json::parse(input);
+        config.enabled = json.value("enabled", config.enabled);
+        config.minecraftTitleAnimation =
+            json.value("minecraftTitleAnimation", config.minecraftTitleAnimation);
+        config.caveBackground = json.value("caveBackground", config.caveBackground);
+        config.replayOnReturnToMenu =
+            json.value("replayOnReturnToMenu", config.replayOnReturnToMenu);
+        config.blockMenuInputDuringIntro =
+            json.value("blockMenuInputDuringIntro", config.blockMenuInputDuringIntro);
+        config.maxPresentationSeconds =
+            json.value("maxPresentationSeconds", config.maxPresentationSeconds);
+        if (json.contains("menuScreenNames")) {
+            config.menuScreenNames = json.at("menuScreenNames").get<std::vector<std::string>>();
+        }
+    } catch (const std::exception& exception) {
+        logger.warn("Cannot parse config.json: ", exception.what(), "; using defaults.");
+    }
+}
+
+}
 
 MyMod& MyMod::getInstance() {
     static MyMod instance;
@@ -15,91 +86,31 @@ MyMod& MyMod::getInstance() {
 }
 
 bool MyMod::load() {
-    if (mLoaded) return true; // PLGetModRegistration, JNI_OnLoad and the shims may all call load()
+    if (mLoaded) return true;
     mLoaded = true;
-    getLogger().info("Initializing Animated Mojang on Android ARM64 (LeviLaunchroid)...");
 
-    // Discover base directory dynamically
-    std::vector<std::filesystem::path> candidates;
-    Dl_info dlinfo;
-    if (dladdr(reinterpret_cast<void*>(&MyMod::getInstance), &dlinfo) && dlinfo.dli_fname) {
-        candidates.push_back(std::filesystem::path(dlinfo.dli_fname).parent_path());
-    }
+    mLogger.info("Loading Animated Mojang through NMDK.");
 
-    std::error_code ec;
-    auto launcherBase = std::filesystem::path("/sdcard/Android/media/org.levimc.launcher/minecraft");
-    if (std::filesystem::exists(launcherBase, ec)) {
-        for (const auto& entry : std::filesystem::directory_iterator(launcherBase, ec)) {
-            if (entry.is_directory(ec)) {
-                candidates.push_back(entry.path() / "mods" / "AnimatedMojang");
-            }
+    const auto candidates = findModDirectories();
+    if (!candidates.empty()) {
+        setModDir(candidates.front());
+        mLogger.info("Mod directory: ", mModDir.string());
+    } else {
+        Dl_info info{};
+        if (dladdr(reinterpret_cast<void*>(&MyMod::getInstance), &info) && info.dli_fname) {
+            setModDir(std::filesystem::path(info.dli_fname).parent_path());
         }
+        mLogger.warn("Could not find the resources directory. Looked beside the native library and in launcher profiles.");
     }
 
-    // Also check parent of library if loaded from a subfolder like lib/
-    if (dladdr(reinterpret_cast<void*>(&MyMod::getInstance), &dlinfo) && dlinfo.dli_fname) {
-        candidates.push_back(std::filesystem::path(dlinfo.dli_fname).parent_path().parent_path());
-    }
-
-    candidates.push_back("/sdcard/Android/media/org.levimc.launcher/minecraft/com.mojang.minecraftpe/mods/AnimatedMojang");
-    candidates.push_back("/sdcard/Android/media/org.levimc.launcher/minecraft/_shared/mods/AnimatedMojang");
-    candidates.push_back("/sdcard/MG/AnimatedMojang");
-    candidates.push_back("/sdcard/Download/AnimatedMojang");
-    candidates.push_back("/data/data/org.levimc.launcher/cache/native_mods/com.mojang.minecraftpe/mods/AnimatedMojang");
-    candidates.push_back("/data/data/com.mojang.minecraftpe/files/mods/AnimatedMojang");
-    candidates.push_back("/sdcard/Android/data/com.mojang.minecraftpe/files/mods/AnimatedMojang");
-    candidates.push_back("/sdcard/Android/data/com.mojang.minecraftpe/files/levilamina/mods/AnimatedMojang");
-
-    bool resolved = false;
-    for (const auto& candidate : candidates) {
-        if (std::filesystem::exists(candidate / "resources" / "data" / "normal_cave.mesh", ec)) {
-            setModDir(candidate);
-            getLogger().info("Resolved mod directory: ", candidate.string());
-            resolved = true;
-            break;
-        }
-    }
-
-    if (!resolved) {
-        getLogger().warn("Failed to find normal_cave.mesh in any candidate path. Defaulting to: ", getModDir().string());
-    }
-
-    // Check for local mod resources directory
-    auto cfgPath = getConfigDir() / "config.json";
-    if (std::filesystem::exists(cfgPath, ec)) {
-        try {
-            std::ifstream f(cfgPath);
-            nlohmann::json j = nlohmann::json::parse(f);
-            mConfig.version = j.value("version", mConfig.version);
-            mConfig.enabled = j.value("enabled", true);
-            mConfig.preferJsonMainMenu = j.value("preferJsonMainMenu", true);
-            mConfig.caveBackground = j.value("caveBackground", true);
-            mConfig.minecraftTitleAnimation = j.value("minecraftTitleAnimation", true);
-            mConfig.restyleLoadingProgress = j.value("restyleLoadingProgress", true);
-            mConfig.replayOnReturnToMenu = j.value("replayOnReturnToMenu", false);
-            mConfig.blockMenuInputDuringIntro = j.value("blockMenuInputDuringIntro", true);
-            mConfig.debugScreens = j.value("debugScreens", false);
-            mConfig.maxPresentationSeconds = j.value("maxPresentationSeconds", 15.0);
-            if (j.contains("titleControlNames")) {
-                mConfig.titleControlNames = j["titleControlNames"].get<std::vector<std::string>>();
-            }
-            if (j.contains("menuScreenNames")) {
-                mConfig.menuScreenNames = j["menuScreenNames"].get<std::vector<std::string>>();
-            }
-        } catch (...) {
-            getLogger().warn("Failed to parse config.json, using defaults.");
-        }
-    }
-
-    // Start mod hooks; cave loading and resource folder files are loaded right after normal loading completes
-    animated_mojang::client::start(mConfig, getModDir());
-
-    getLogger().info("Animated Mojang loaded and enabled successfully for Bedrock!");
+    loadConfig(mConfigDir / "config.json", mConfig, mLogger);
+    animated_mojang::client::start(mConfig, mModDir);
+    mLogger.info("Initialization completed.");
     return true;
 }
 
 bool MyMod::enable() {
-    animated_mojang::client::start(mConfig, getModDir());
+    animated_mojang::client::start(mConfig, mModDir);
     return true;
 }
 
@@ -113,11 +124,7 @@ bool MyMod::unload() {
     return true;
 }
 
-} // namespace my_mod
-
-// ----------------------------------------------------------------------------
-// Exported Lifecycle Entrypoints for LeviLaunchroid & LeviLamina
-// ----------------------------------------------------------------------------
+}
 
 struct PLModRegistration {
     void* instance;
@@ -127,89 +134,36 @@ struct PLModRegistration {
     bool (*unload)(void* instance, void* context);
 };
 
-static bool pl_load_shim(void*, void*) {
-    return my_mod::MyMod::getInstance().load();
-}
-static bool pl_enable_shim(void*, void*) {
-    return my_mod::MyMod::getInstance().enable();
-}
-static bool pl_disable_shim(void*, void*) {
-    return my_mod::MyMod::getInstance().disable();
-}
-static bool pl_unload_shim(void*, void*) {
-    return my_mod::MyMod::getInstance().unload();
-}
+static bool plLoad(void*, void*) { return my_mod::MyMod::getInstance().load(); }
+static bool plEnable(void*, void*) { return my_mod::MyMod::getInstance().enable(); }
+static bool plDisable(void*, void*) { return my_mod::MyMod::getInstance().disable(); }
+static bool plUnload(void*, void*) { return my_mod::MyMod::getInstance().unload(); }
 
-static PLModRegistration sPLRegistration = {
-    &my_mod::MyMod::getInstance(),
-    pl_load_shim,
-    pl_enable_shim,
-    pl_disable_shim,
-    pl_unload_shim
+static PLModRegistration sRegistration = {
+    &my_mod::MyMod::getInstance(), plLoad, plEnable, plDisable, plUnload
 };
 
-extern "C" {
-
-#if defined(__GNUC__)
+#if defined(__GNUC__) || defined(__clang__)
 #define MOD_EXPORT __attribute__((visibility("default")))
 #else
 #define MOD_EXPORT
 #endif
 
-// LeviLauncher / LeviLaunchroid PreLoader ABI Entrypoint
+extern "C" {
+
 MOD_EXPORT const void* PLGetModRegistration() {
-    my_mod::MyMod::getInstance().load();
-    my_mod::MyMod::getInstance().enable();
-    return &sPLRegistration;
+    auto& mod = my_mod::MyMod::getInstance();
+    mod.load();
+    mod.enable();
+    return &sRegistration;
 }
 
-// LeviLamina Compatibility Entrypoints
-MOD_EXPORT bool ll_mod_load(void* /*modContext*/) {
-    return my_mod::MyMod::getInstance().load();
-}
-
-MOD_EXPORT bool ll_mod_enable(void* /*modContext*/) {
-    return my_mod::MyMod::getInstance().enable();
-}
-
-MOD_EXPORT bool ll_mod_disable(void* /*modContext*/) {
-    return my_mod::MyMod::getInstance().disable();
-}
-
-// Android Dynamic Linker Entrypoint
 using jint = int32_t;
-MOD_EXPORT jint JNI_OnLoad(void* /*vm*/, void* /*reserved*/) {
-    my_mod::MyMod::getInstance().load();
-    my_mod::MyMod::getInstance().enable();
+MOD_EXPORT jint JNI_OnLoad(void*, void*) {
+    auto& mod = my_mod::MyMod::getInstance();
+    mod.load();
+    mod.enable();
     return 0x00010006;
 }
 
-// ----------------------------------------------------------------------------
-// NDK libc++ Fallback Symbols for older/differing Android dynamic linkers
-// Prevents "dlopen failed: cannot locate symbol _ZNSt6__ndk113__hash_memoryEPKvm"
-// ----------------------------------------------------------------------------
-MOD_EXPORT size_t _ZNSt6__ndk113__hash_memoryEPKvm(const void* ptr, size_t len) {
-    const auto* data = static_cast<const unsigned char*>(ptr);
-    size_t hash = 14695981039346656037ULL;
-    for (size_t i = 0; i < len; ++i) {
-        hash ^= data[i];
-        hash *= 1099511628211ULL;
-    }
-    return hash;
 }
-
-MOD_EXPORT size_t _ZNSt6__ndk112__next_primeEm(size_t n) {
-    static const size_t primes[] = {
-        53UL, 97UL, 193UL, 389UL, 769UL, 1543UL, 3079UL, 6151UL, 12289UL, 24593UL,
-        49157UL, 98317UL, 196613UL, 393241UL, 786433UL, 1572869UL, 3145739UL,
-        6291469UL, 12582917UL, 25165843UL, 50331653UL, 100663319UL, 201326611UL,
-        402653189UL, 805306457UL, 1610612741UL, 3221225473UL, 4294967291UL
-    };
-    for (size_t p : primes) {
-        if (p >= n) return p;
-    }
-    return n | 1;
-}
-
-}
-

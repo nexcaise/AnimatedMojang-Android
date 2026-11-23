@@ -6,66 +6,58 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to (re)publish, e.g. v1.0.2"
+        description: "Existing tag to publish, e.g. v2.1.0"
         required: true
 
 permissions:
   contents: write
 
 jobs:
-  check-version:
-    name: Tag matches manifest versions
+  version:
     runs-on: ubuntu-24.04
     outputs:
-      tag: ${{ steps.t.outputs.tag }}
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
-      - id: t
+      - id: version
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          VER="${TAG#v}"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          python3 - "$VER" <<'PY'
+          VERSION="${TAG#v}"
+          python3 - "$VERSION" <<'PY'
           import json, sys
-          want = sys.argv[1]
-          for f in ("manifest.json", "tooth.json"):
-              got = json.load(open(f))["version"]
-              if got != want:
-                  sys.exit(f"::error::{f} version is {got}, tag says {want}")
-          print("versions OK:", want)
+          expected = sys.argv[1]
+          for path in ("manifest.json", "tooth.json"):
+              actual = json.load(open(path))["version"]
+              if actual != expected:
+                  raise SystemExit(f"{path}: expected {expected}, got {actual}")
           PY
-
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
   build:
-    needs: check-version
+    needs: version
     uses: ./.github/workflows/build.yml
-
   publish:
-    name: Publish GitHub release
     runs-on: ubuntu-24.04
-    needs: [check-version, build]
+    needs: [version, build]
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.check-version.outputs.tag }}
-
+          ref: ${{ needs.version.outputs.tag }}
       - uses: actions/download-artifact@v4
         with:
-          name: animated_mojang-levipack
+          name: animated-mojang-levipack
           path: dist
-
-      - name: Extract release notes from CHANGELOG.md
+      - name: Prepare release notes
         run: |
-          VER="${{ needs.check-version.outputs.tag }}"; VER="${VER#v}"
-          awk -v v="$VER" '$0 ~ "^## \\[" v "\\]" {f=1; next} /^## \[/ {f=0} f' CHANGELOG.md > notes.md
-          [ -s notes.md ] || echo "Release $VER" > notes.md
-          cat notes.md
-
+          VERSION="${{ needs.version.outputs.tag }}"
+          VERSION="${VERSION#v}"
+          awk -v v="$VERSION" '$0 ~ "^## \\[" v "\\]" {show=1; next} /^## \[/ {show=0} show' CHANGELOG.md > notes.md
+          test -s notes.md || echo "Animated Mojang $VERSION" > notes.md
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ needs.check-version.outputs.tag }}
-          name: Animated Mojang ${{ needs.check-version.outputs.tag }}
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: Animated Mojang ${{ needs.version.outputs.tag }}
           body_path: notes.md
-          files: dist/animated_mojang.levipack # name matches tooth.json's release URL
+          files: dist/animated_mojang.levipack
           fail_on_unmatched_files: true

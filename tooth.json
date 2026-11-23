@@ -1,18 +1,19 @@
 {
   "format_version": 3,
   "format_uuid": "289f771f-2c9a-4d73-9f3f-8492495a924d",
-  "tooth": "github.com/spygamingog/Animated-Mojang-Android",
-  "version": "1.0.2",
+  "tooth": "github.com/NexCaise/AnimatedMojang-Android",
+  "version": "2.3.2",
   "info": {
-    "name": "Animated Mojang (Android ARM64)",
-    "author": "SpyGamingOG",
-    "description": "by SpyGamingOG",
+    "name": "AnimatedMojang",
+    "author": "NexCaise Team",
+    "description": "REQUIRE NMDK!, Animated Mojang Intro native mod powered by NMDK for Minecraft Bedrock Android arm64-v8a.",
     "tags": [
       "platform:android-arm64",
       "type:mod",
-      "platform:client"
+      "platform:client",
+      "framework:nmdk"
     ],
-    "avatar_url": "https://github.com/spygamingog.png"
+    "avatar_url": "https://nexcaise.my.id/mc/creeper-logo.png"
   },
   "variants": [
     {

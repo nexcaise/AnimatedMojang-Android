@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "id": "animatedmojang",
+  "version": "2.3.2",
+  "minecraft_versions": [
+    "1.26.6X.X"
+  ],
+  "info": {
+    "name": "AnimatedMojang",
+    "author": "NexCaise Team",
+    "description": "REQUIRE NMDK!, Animated Mojang Intro native mod powered by NMDK for Minecraft Bedrock Android arm64-v8a.",
+    "homepage_url": "https://github.com/NexCaise/AnimatedMojang-Android",
+    "icon": "https://nexcaise.my.id/mc/creeper-logo.png",
+    "tags": [
+      "Animation",
+      "Visual"
+    ]
+  },
+  "release_assets": {
+    "include": [
+      "*.levipack"
+    ],
+    "labels": {
+      "animated_mojang.levipack": "LeviPack",
+    }
+  }
+}
